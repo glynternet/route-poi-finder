@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"gopkg.in/yaml.v3"
 	"io"
 	"log"
 	"net/http"
@@ -22,25 +21,103 @@ import (
 const (
 	stateHome = `/home/g/tmp/route-poi-finder-state`
 
-	queriesCfg = `# Need to get nodes and ways
-- - amenity~"^(bar|biergarten|cafe|fast_food|food_court|fuel|ice_cream|pub|restaurant|bicycle_repair_station|compressed_air|drinking_water|shelter|toilets|water_point|marketplace|place_of_worship)$"
-- - tourism~"^(alpine_hut|camp_pitch|camp_site|guest_house|hostel|picnic_site|viewpoint|wilderness_hut)$"
-- - amenity="fountain"
-  - drinking_water!="no"
-  - drinking_water~".+"
-- - leisure~"^(nature_reserve|park|picnic_table|wildlife_hide)$"
-- - natural~"^(spring|peak)$"
-- - man_made~"^(spring_box|water_well|water_tap)$"
-- - place~"^(town|village|hamlet|city|neighbourhood)$"`
-
 	gpxFile = `/home/g/Downloads/2021-11-27_580704200_North_South_CO_2023.gpx`
 
 	split = 10
 )
 
-// API
+type query []struct {
+	tag    string
+	values []string
+	not    string
+}
 
-type query []string
+var queries = []query{{{
+	// - - amenity~"^(bar|biergarten|cafe|fast_food|food_court|fuel|ice_cream|pub|restaurant|bicycle_repair_station|compressed_air|drinking_water|shelter|toilets|water_point|marketplace|place_of_worship)$"
+	tag: "amenity",
+	values: []string{
+		"bar",
+		"biergarten",
+		"cafe",
+		"fast_food",
+		"food_court",
+		"fuel",
+		"ice_cream",
+		"pub",
+		"restaurant",
+		"bicycle_repair_station",
+		"compressed_air",
+		"drinking_water",
+		"shelter",
+		"toilets",
+		"water_point",
+		"marketplace",
+		"place_of_worship",
+	},
+}}, {{
+	// - - tourism~"^(alpine_hut|camp_pitch|camp_site|guest_house|hostel|picnic_site|viewpoint|wilderness_hut)$"
+	tag: "tourism",
+	values: []string{
+		"alpine_hut",
+		"camp_pitch",
+		"camp_site",
+		"guest_house",
+		"hostel",
+		"picnic_site",
+		"viewpoint",
+		"wilderness_hut",
+	},
+}}, {{
+	// - - leisure~"^(nature_reserve|park|picnic_table|wildlife_hide)$"
+	tag: "leisure",
+	values: []string{
+		"nature_reserve",
+		"park",
+		"picnic_table",
+		"wildlife_hide",
+	},
+}}, {{
+	// - - natural~"^(spring|peak)$"
+	tag: "natural",
+	values: []string{
+		"spring",
+		"peak",
+	},
+}}, {{
+	// - - man_made~"^(spring_box|water_well|water_tap)$"
+	tag: "man_made",
+	values: []string{
+		"spring_box",
+		"water_well",
+		"water_tap",
+	},
+}}, {{
+	// - - place~"^(town|village|hamlet|city|neighbourhood)$"
+	tag: "place",
+	values: []string{
+		"town",
+		"village",
+		"hamlet",
+		"city",
+		"neighbourhood",
+	},
+}}, {
+	//- - amenity="fountain"
+	//  - drinking_water!="no"
+	//  - drinking_water~".+"
+	{
+		tag:    "amenity",
+		values: []string{"fountain"},
+	}, {
+		tag:    "drinking_water",
+		values: []string{".+"},
+	}, {
+		tag: "drinking_water",
+		not: "no",
+	},
+}}
+
+// API
 
 type response struct {
 	Elements []element `json:"elements"`
@@ -126,11 +203,6 @@ func mainErr() error {
 		splitPoints += int64(len(points))
 	}
 	log.Println("splits:", len(splits), "points:", splitPoints)
-
-	var queries []query
-	if err := yaml.Unmarshal([]byte(queriesCfg), &queries); err != nil {
-		return fmt.Errorf("unmarshalling config: %w", err)
-	}
 
 	var pois []Point
 	for _, split := range splits {
@@ -273,10 +345,6 @@ func nodes(elements query, aroundRoute string) ([]element, error) {
 		}
 	}
 
-	sort.Slice(responseElements, func(i, j int) bool {
-		return responseElements[i].ID < responseElements[j].ID
-	})
-
 	return responseElements, nil
 }
 
@@ -320,26 +388,35 @@ func wayCentres(elements query, route string) ([]wayCentre, error) {
 		})
 	}
 
-	sort.Slice(wayCentres, func(i, j int) bool {
-		return wayCentres[i].ID < wayCentres[j].ID
-	})
-
 	return wayCentres, nil
 }
 
-func queryResponseElements(queryType string, elements query, route string) ([]element, error) {
+func queryResponseElements(queryType string, query query, route string) ([]element, error) {
 	var sb strings.Builder
 	sb.WriteString(`[out:json];` + queryType)
-	for _, element := range elements {
-		if _, err := sb.WriteString(`[` + element + `]`); err != nil {
+	for _, element := range query {
+		if element.not != "" && len(element.values) > 0 {
+			return nil, fmt.Errorf("query element contains both 'not' and 'values': %+v", element)
+		}
+		var elementCondition string
+		switch {
+		case len(element.values) > 0:
+			elementCondition = fmt.Sprintf(`%s~"^(%s)$"`, element.tag, strings.Join(element.values, "|"))
+		case element.not != "":
+			// THIS IS THE BUG WITH THE "
+			elementCondition = fmt.Sprintf(`%s!="%s"`, element.tag, element.not)
+		default:
+			return nil, fmt.Errorf("query element contains no conditions: %+v", element)
+		}
+		if _, err := sb.WriteString(`[` + elementCondition + `]`); err != nil {
 			return nil, fmt.Errorf("writing query element: %w", err)
 		}
 	}
 	sb.WriteString(route)
 
-	query := sb.String()
+	renderedQuery := sb.String()
 	hasher := sha1.New()
-	if _, err := hasher.Write([]byte(query)); err != nil {
+	if _, err := hasher.Write([]byte(renderedQuery)); err != nil {
 		return nil, fmt.Errorf("hashing query: %w", err)
 	}
 	sha := base64.URLEncoding.EncodeToString(hasher.Sum(nil))
@@ -350,15 +427,20 @@ func queryResponseElements(queryType string, elements query, route string) ([]el
 		log.Printf("query fetched from cached result: %s", queryStateFilePath)
 		rc = stored
 	} else if os.IsNotExist(err) {
-		log.Printf("query result not cached, making query to API: %s:%s", queryType, elements)
+		log.Printf("query result not cached, making query to API: %s:%s", queryType, query)
 		// curl -d @<(cat <(echo "[out:json];$type$params") ~/tmp/pois/query_end) -X POST http://overpass-api.de/api/interpreter
-		resp, err := http.Post(`http://overpass-api.de/api/interpreter`, "", strings.NewReader(query))
+		resp, err := http.Post(`http://overpass-api.de/api/interpreter`, "", strings.NewReader(renderedQuery))
 		if err != nil {
-			return nil, fmt.Errorf("posting query(%s): %w", elements, err)
+			return nil, fmt.Errorf("posting query(%s): %w", query, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			_, _ = io.Copy(os.Stderr, resp.Body)
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("posting query (%s:%s): unexpected status code %d (%s)", queryType, query, resp.StatusCode, resp.Status)
 		}
 		file, err := os.OpenFile(queryStateFilePath, os.O_RDWR|os.O_CREATE, 0666)
 		if err != nil {
-			return nil, fmt.Errorf("opening query file for writing(%s): %w", elements, err)
+			return nil, fmt.Errorf("opening query file for writing(%s): %w", query, err)
 		}
 		if _, err := io.Copy(file, resp.Body); err != nil {
 			return nil, fmt.Errorf("outputing response body: %w", err)
@@ -377,9 +459,12 @@ func queryResponseElements(queryType string, elements query, route string) ([]el
 
 	var r response
 	if err := json.NewDecoder(rc).Decode(&r); err != nil {
+		_ = rc.Close()
 		return nil, fmt.Errorf("decoding response body: %w", err)
 	}
-
+	if err := rc.Close(); err != nil {
+		return nil, fmt.Errorf("closing response body: %w", err)
+	}
 	return r.Elements, nil
 }
 
