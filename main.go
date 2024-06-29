@@ -492,14 +492,17 @@ func queryResponseElements(queryType string, query query, route string) ([]eleme
 }
 
 func resolveName(tags map[string]interface{}) (string, error) {
-	if n, ok := tags["name"]; ok {
-		return n.(string), nil
-	} else if a, ok := tags["amenity"]; ok {
-		return a.(string), nil
-	} else if a, ok := tags["tourism"]; ok {
-		return a.(string), nil
-	} else if a, ok := tags["leisure"]; ok {
-		return a.(string), nil
+	for _, tag := range []string{
+		"name",
+		"amenity",
+		"tourism",
+		"leisure",
+		"shop",
+	} {
+		n, ok := tags[tag].(string)
+		if ok {
+			return n, nil
+		}
 	}
 	return "", errors.New("no suitable tag for name")
 }
