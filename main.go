@@ -30,7 +30,8 @@ const (
   - drinking_water~".+"
 - - leisure~"^(nature_reserve|park|picnic_table|wildlife_hide)$"
 - - natural~"^(spring|peak)$"
-- - man_made~"^(spring_box|water_well|water_tap)$"`
+- - man_made~"^(spring_box|water_well|water_tap)$"
+- - place~"^(town|village|hamlet|city|neighbourhood)$"`
 
 	gpxFile = `/home/g/Downloads/2021-11-27_580704200_North_South_CO_2023.gpx`
 
@@ -167,6 +168,24 @@ func mainErr() error {
 			}
 		}
 	}
+	sort.Slice(pois, func(i, j int) bool {
+		if pois[i] == pois[j] {
+			return false
+		}
+		if pois[i].Name != pois[j].Name {
+			return pois[i].Name < pois[j].Name
+		}
+		if pois[i].Description != pois[j].Description {
+			return pois[i].Description < pois[j].Description
+		}
+		if pois[i].Symbol != pois[j].Symbol {
+			return pois[i].Symbol < pois[j].Symbol
+		}
+		if pois[i].Lat != pois[j].Lat {
+			return pois[i].Lat < pois[j].Lat
+		}
+		return pois[i].Lon < pois[j].Lon
+	})
 
 	f, err = os.CreateTemp("", "pois-json")
 	if err != nil {
