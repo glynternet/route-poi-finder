@@ -115,7 +115,30 @@ var queries = []query{{{
 		tag: "drinking_water",
 		not: "no",
 	},
-}}
+}, {{
+	tag: "shop",
+	values: []string{
+		"bakery",
+		"cheese",
+		"coffee",
+		"convenience",
+		"dairy",
+		"farm",
+		"food",
+		"greengrocer",
+		"health_food",
+		"ice_cream",
+		"pastry",
+		"tortilla",
+		"water",
+		"general",
+		"kiosk",
+		"supermarket",
+		"chemist",
+		"bicycle",
+		"sports",
+	},
+}}}
 
 // API
 
