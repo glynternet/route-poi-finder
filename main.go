@@ -4,6 +4,7 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"gopkg.in/yaml.v3"
 	"io"
@@ -45,30 +46,39 @@ type response struct {
 }
 
 type element struct {
-	Type  string  `json:"type"`
-	ID    int64   `json:"id"`
-	Lat   float64 `json:"lat"`
-	Lon   float64 `json:"lon"`
-	Nodes []int64 `json:"nodes"`
-}
-
-type way struct {
-	Nodes []int64 `json:"nodes"`
+	Type  string                 `json:"type"`
+	ID    int64                  `json:"id"`
+	Lat   float64                `json:"lat"`
+	Lon   float64                `json:"lon"`
+	Nodes []int64                `json:"nodes"`
+	Tags  map[string]interface{} `json:"tags"`
 }
 
 // MODEL
 
-type point struct {
+type LatLon struct {
 	Lat float64
 	Lon float64
 }
 
 type wayCentre struct {
 	ID     int64
-	Centre point
+	Centre LatLon
+	Tags   map[string]interface{}
+}
+
+// Point is stolen from gpx project, should really import it instead
+type Point struct {
+	// field names matched to GPX spec
+	Name        string  `json:"name"`
+	Lat         float64 `json:"lat"`
+	Lon         float64 `json:"lon"`
+	Description string  `json:"desc"`
+	Symbol      string  `json:"sym"`
 }
 
 func main() {
+	log.SetFlags(log.Lshortfile)
 	if err := mainErr(); err != nil {
 		log.Println(err.Error())
 		os.Exit(1)
@@ -121,6 +131,7 @@ func mainErr() error {
 		return fmt.Errorf("unmarshalling config: %w", err)
 	}
 
+	var pois []Point
 	for _, split := range splits {
 		aroundRoute, err := queryRouteComponent(80, split)
 		if err != nil {
@@ -133,16 +144,61 @@ func mainErr() error {
 				return fmt.Errorf("getting nodes: %w", err)
 			}
 
+			for _, node := range nodes {
+				pt, err := point(node.Tags, LatLon{
+					Lat: node.Lat,
+					Lon: node.Lon,
+				})
+				if err != nil {
+					return fmt.Errorf("getting point for node(%v): %w", node, err)
+				}
+				pois = append(pois, pt)
+			}
 			wayCentres, err := wayCentres(elements, aroundRoute)
 			if err != nil {
 				return fmt.Errorf("getting way centres: %w", err)
 			}
-
-			log.Println(wayCentres, nodes)
+			for _, wayCentre := range wayCentres {
+				pt, err := point(wayCentre.Tags, wayCentre.Centre)
+				if err != nil {
+					return fmt.Errorf("getting point for way(%v): %w", wayCentre, err)
+				}
+				pois = append(pois, pt)
+			}
 		}
 	}
 
+	f, err = os.CreateTemp("", "pois-json")
+	if err != nil {
+		return fmt.Errorf("creating temp file for output: %w", err)
+	}
+	if err := json.NewEncoder(f).Encode(pois); err != nil {
+		return fmt.Errorf("writing output json: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("closing output json file(%s): %w", f.Name(), err)
+	}
+	log.Println("output:", f.Name())
 	return nil
+}
+
+func point(tags map[string]interface{}, latLon LatLon) (Point, error) {
+	name, err := resolveName(tags)
+	if err != nil {
+		return Point{}, fmt.Errorf("resolving node name from tags(%v): %w", tags, err)
+	}
+	desc, err := json.Marshal(tags)
+	if err != nil {
+		return Point{}, fmt.Errorf("marshalling node tags for description: %w", err)
+	}
+	nodePoint := Point{
+		Name:        name,
+		Lat:         latLon.Lat,
+		Lon:         latLon.Lon,
+		Description: string(desc),
+		Symbol:      resolveSymbol(tags),
+	}
+	return nodePoint, nil
 }
 
 func queryRouteComponent(locus int, route []gpxgo.GPXPoint) (string, error) {
@@ -212,7 +268,6 @@ func wayCentres(elements query, route string) ([]wayCentre, error) {
 	nodes := make(map[int64]element)
 	ways := make(map[int64]element)
 	for _, e := range responseElements {
-		fmt.Println(e)
 		switch e.Type {
 		case `node`:
 			nodes[e.ID] = e
@@ -228,7 +283,7 @@ func wayCentres(elements query, route string) ([]wayCentre, error) {
 		if len(way.Nodes) == 0 {
 			return nil, fmt.Errorf("no nodes for way %d", way.ID)
 		}
-		var centre point
+		var centre LatLon
 		for _, nodeID := range way.Nodes {
 			node, ok := nodes[nodeID]
 			if !ok {
@@ -240,6 +295,7 @@ func wayCentres(elements query, route string) ([]wayCentre, error) {
 		wayCentres = append(wayCentres, wayCentre{
 			ID:     way.ID,
 			Centre: centre,
+			Tags:   way.Tags,
 		})
 	}
 
@@ -304,4 +360,58 @@ func queryResponseElements(queryType string, elements query, route string) ([]el
 	}
 
 	return r.Elements, nil
+}
+
+func resolveName(tags map[string]interface{}) (string, error) {
+	if n, ok := tags["name"]; ok {
+		return n.(string), nil
+	} else if a, ok := tags["amenity"]; ok {
+		return a.(string), nil
+	} else if a, ok := tags["tourism"]; ok {
+		return a.(string), nil
+	} else if a, ok := tags["leisure"]; ok {
+		return a.(string), nil
+	}
+	return "", errors.New("no suitable tag for name")
+}
+
+func resolveSymbol(tags map[string]interface{}) string {
+	var symbol string
+	for _, symbolMatchers := range []struct {
+		tags   map[string]string
+		symbol string
+	}{
+		{tags: map[string]string{"leisure": "park"}, symbol: "Park"},
+		{tags: map[string]string{"amenity": "toilets"}, symbol: "Restroom"},
+		{tags: map[string]string{"amenity": "drinking_water"}, symbol: "Drinking Water"},
+		{tags: map[string]string{"natural": "peak"}, symbol: "Summit"},
+		{tags: map[string]string{"tourism": "viewpoint"}, symbol: "Scenic Area"},
+		{tags: map[string]string{"amenity": "bicycle_repair_station"}, symbol: "Mine"},
+		{tags: map[string]string{"amenity": "fast_food"}, symbol: "Fast Food"},
+		{tags: map[string]string{"amenity": "fuel"}, symbol: "Gas Station"},
+		{tags: map[string]string{"amenity": "pub"}, symbol: "Bar"},
+		{tags: map[string]string{"amenity": "cafe"}, symbol: "Restaurant"},
+		{tags: map[string]string{"tourism": "picnic_site"}, symbol: "Picnic Area"},
+		{tags: map[string]string{"amenity": "restaurant", "cuisine": "pizza"}, symbol: "Pizza"},
+		{tags: map[string]string{"amenity": "restaurant"}, symbol: "Restaurant"},
+		{tags: map[string]string{"amenity": "ice_cream"}, symbol: "Fast Food"},
+		{tags: map[string]string{"tourism": "camp_pitch"}, symbol: "Campground"},
+		{tags: map[string]string{"leisure": "nature_reserve"}, symbol: "Park"},
+		{tags: map[string]string{"amenity": "shelter"}, symbol: "Building"},
+		{tags: map[string]string{"amenity": "place_of_worship"}, symbol: "Church"},
+	} {
+		match := true
+		for k, matcherV := range symbolMatchers.tags {
+			v, ok := tags[k]
+			if !ok || v != matcherV {
+				match = false
+				break
+			}
+		}
+		if match {
+			symbol = symbolMatchers.symbol
+			break
+		}
+	}
+	return symbol
 }
