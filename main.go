@@ -172,7 +172,9 @@ func mainErr() error {
 	if err != nil {
 		return fmt.Errorf("creating temp file for output: %w", err)
 	}
-	if err := json.NewEncoder(f).Encode(pois); err != nil {
+	encoder := json.NewEncoder(f)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(pois); err != nil {
 		return fmt.Errorf("writing output json: %w", err)
 	}
 	if err := f.Close(); err != nil {
