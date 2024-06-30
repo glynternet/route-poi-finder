@@ -96,6 +96,12 @@ var queries = []query{{{
 	values: []string{
 		"spring",
 		"peak",
+		"mountain_range",
+		"ridge",
+		"arete",
+		"hot spring",
+		"plateu",
+		"saddle",
 	},
 }}, {{
 	// - - man_made~"^(spring_box|water_well|water_tap)$"
@@ -161,6 +167,9 @@ var queries = []query{{{
 		"bicycle",
 		"sports",
 	},
+}}, {{
+	tag:    "mountain_pass",
+	values: []string{"yes"},
 }}}
 
 // API
@@ -317,7 +326,7 @@ func mainErr() error {
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("closing output json file(%s): %w", f.Name(), err)
 	}
-	log.Println("output:", f.Name())
+	log.Println("output:", f.Name(), "points:", len(pois))
 	return nil
 }
 
@@ -540,6 +549,7 @@ func resolveName(tags map[string]interface{}) (string, error) {
 		"leisure",
 		"shop",
 		"waterway",
+		"natural",
 	} {
 		n, ok := tags[tag].(string)
 		if ok {
