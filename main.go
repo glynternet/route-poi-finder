@@ -703,11 +703,14 @@ func resolveSymbol(tags map[string]interface{}) string {
 		symbol string
 	}{
 		{tags: map[string]string{"shop": "convenience"}, symbol: "Shopping Center"},
+		{tags: map[string]string{"shop": "supermarket"}, symbol: "Shopping Center"},
 		{tags: map[string]string{"leisure": "park"}, symbol: "Park"},
 		{tags: map[string]string{"boundary": "protected_area"}, symbol: "Park"},
 		{tags: map[string]string{"amenity": "toilets"}, symbol: "Restroom"},
 		{tags: map[string]string{"amenity": "drinking_water"}, symbol: "Drinking Water"},
 		{tags: map[string]string{"natural": "peak"}, symbol: "Summit"},
+		{tags: map[string]string{"natural": "saddle"}, symbol: "Summit"},
+		{tags: map[string]string{"mountain_pass": "yes"}, symbol: "Summit"},
 		{tags: map[string]string{"tourism": "viewpoint"}, symbol: "Scenic Area"},
 		{tags: map[string]string{"amenity": "bicycle_repair_station"}, symbol: "Mine"},
 		{tags: map[string]string{"amenity": "fast_food"}, symbol: "Fast Food"},
@@ -729,6 +732,7 @@ func resolveSymbol(tags map[string]interface{}) string {
 		{tags: map[string]string{"place": "hamlet"}, symbol: "City Hall"},
 		{tags: map[string]string{"place": "city"}, symbol: "City Hall"},
 		{tags: map[string]string{"place": "neighbourhood"}, symbol: "City Hall"},
+		{tags: map[string]string{"waterway": "river"}, symbol: "Water Source"},
 	} {
 		match := true
 		for k, matcherV := range symbolMatchers.tags {
