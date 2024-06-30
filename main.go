@@ -26,10 +26,18 @@ const (
 	split = 10
 )
 
+const (
+	// TODO(glynternet): workout better API
+	ExistsUndefined = iota
+	ExistsYes
+	ExistsNo
+)
+
 type query []struct {
 	tag    string
 	values []string
 	not    string
+	exists int
 }
 
 var queries = []query{{{
@@ -37,22 +45,28 @@ var queries = []query{{{
 	tag: "amenity",
 	values: []string{
 		"bar",
+		"bicycle_rental",
+		"bicycle_repair_station",
+		"bicycle_wash",
 		"biergarten",
 		"cafe",
-		"fast_food",
-		"food_court",
-		"fuel",
-		"ice_cream",
-		"pub",
-		"restaurant",
-		"bicycle_repair_station",
 		"compressed_air",
 		"drinking_water",
-		"shelter",
-		"toilets",
-		"water_point",
+		"fast_food",
+		"food_court",
+		"fountain",
+		"fuel",
+		"ice_cream",
 		"marketplace",
 		"place_of_worship",
+		"pub",
+		"public_bath",
+		"restaurant",
+		"shelter",
+		"shower",
+		"toilets",
+		"water_point",
+		"watering_place",
 	},
 }}, {{
 	// - - tourism~"^(alpine_hut|camp_pitch|camp_site|guest_house|hostel|picnic_site|viewpoint|wilderness_hut)$"
@@ -90,7 +104,16 @@ var queries = []query{{{
 		"spring_box",
 		"water_well",
 		"water_tap",
+		"drinking_fountain",
 	},
+}}, {{
+	tag: "drinking_water",
+	values: []string{
+		"yes",
+	},
+}}, {{
+	tag:    "waterway",
+	exists: ExistsYes,
 }}, {{
 	// - - place~"^(town|village|hamlet|city|neighbourhood)$"
 	tag: "place",
@@ -301,7 +324,7 @@ func mainErr() error {
 func point(tags map[string]interface{}, latLon LatLon) (Point, error) {
 	name, err := resolveName(tags)
 	if err != nil {
-		return Point{}, fmt.Errorf("resolving node name from tags(%v): %w", tags, err)
+		return Point{}, fmt.Errorf("resolving name from tags(%v): %w", tags, err)
 	}
 	desc, err := json.Marshal(tags)
 	if err != nil {
@@ -418,16 +441,34 @@ func queryResponseElements(queryType string, query query, route string) ([]eleme
 	var sb strings.Builder
 	sb.WriteString(`[out:json];` + queryType)
 	for _, element := range query {
-		if element.not != "" && len(element.values) > 0 {
-			return nil, fmt.Errorf("query element contains both 'not' and 'values': %+v", element)
+		var definedConditions int
+		for _, condition := range []bool{
+			element.not != "",
+			len(element.values) > 0,
+			element.exists != ExistsUndefined,
+		} {
+			if condition {
+				definedConditions++
+			}
+		}
+		if definedConditions > 1 {
+			return nil, fmt.Errorf("query element must contain only one condition: 'not', 'values' or 'exists': %+v", element)
 		}
 		var elementCondition string
 		switch {
 		case len(element.values) > 0:
 			elementCondition = fmt.Sprintf(`%s~"^(%s)$"`, element.tag, strings.Join(element.values, "|"))
 		case element.not != "":
-			// THIS IS THE BUG WITH THE "
 			elementCondition = fmt.Sprintf(`%s!="%s"`, element.tag, element.not)
+		case element.exists != ExistsUndefined:
+			switch element.exists {
+			case ExistsYes:
+				elementCondition = fmt.Sprintf(`%s`, element.tag)
+			case ExistsNo:
+				elementCondition = fmt.Sprintf(`!%s`, element.tag)
+			default:
+				return nil, fmt.Errorf("unsupported exists value: %+v", element.exists)
+			}
 		default:
 			return nil, fmt.Errorf("query element contains no conditions: %+v", element)
 		}
@@ -450,11 +491,11 @@ func queryResponseElements(queryType string, query query, route string) ([]eleme
 		log.Printf("query fetched from cached result: %s", queryStateFilePath)
 		rc = stored
 	} else if os.IsNotExist(err) {
-		log.Printf("query result not cached, making query to API: %s:%s", queryType, query)
+		log.Printf("query result not cached, making query to API: %s:%+v", queryType, query)
 		// curl -d @<(cat <(echo "[out:json];$type$params") ~/tmp/pois/query_end) -X POST http://overpass-api.de/api/interpreter
 		resp, err := http.Post(`http://overpass-api.de/api/interpreter`, "", strings.NewReader(renderedQuery))
 		if err != nil {
-			return nil, fmt.Errorf("posting query(%s): %w", query, err)
+			return nil, fmt.Errorf("posting query(%+v): %w", query, err)
 		}
 		if resp.StatusCode != http.StatusOK {
 			_, _ = io.Copy(os.Stderr, resp.Body)
@@ -463,7 +504,7 @@ func queryResponseElements(queryType string, query query, route string) ([]eleme
 		}
 		file, err := os.OpenFile(queryStateFilePath, os.O_RDWR|os.O_CREATE, 0666)
 		if err != nil {
-			return nil, fmt.Errorf("opening query file for writing(%s): %w", query, err)
+			return nil, fmt.Errorf("opening query file for writing(%+v): %w", query, err)
 		}
 		if _, err := io.Copy(file, resp.Body); err != nil {
 			return nil, fmt.Errorf("outputing response body: %w", err)
@@ -498,6 +539,7 @@ func resolveName(tags map[string]interface{}) (string, error) {
 		"tourism",
 		"leisure",
 		"shop",
+		"waterway",
 	} {
 		n, ok := tags[tag].(string)
 		if ok {
