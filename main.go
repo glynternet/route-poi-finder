@@ -19,11 +19,9 @@ import (
 )
 
 const (
-	stateHome = `/home/g/tmp/route-poi-finder-state`
+	dataDir = `/tmp/route-poi-finder-state`
 
-	gpxFile = `/home/g/Downloads/2021-11-27_580704200_North_South_CO_2023.gpx`
-
-	split = 10
+	split = 1
 )
 
 const (
@@ -272,15 +270,19 @@ type Point struct {
 
 func main() {
 	log.SetFlags(log.Lshortfile)
-	if err := mainErr(); err != nil {
+	if len(os.Args) < 2 {
+		log.Println("must provide args")
+		os.Exit(1)
+	}
+	if err := mainErr(os.Args[1]); err != nil {
 		log.Println(err.Error())
 		os.Exit(1)
 	}
 	os.Exit(0)
 }
 
-func mainErr() error {
-	f, err := os.Open(gpxFile)
+func mainErr(file string) error {
+	f, err := os.Open(file)
 	if err != nil {
 		return fmt.Errorf("opening gpx file: %w", err)
 	}
@@ -297,8 +299,23 @@ func mainErr() error {
 		return fmt.Errorf("expected gpx track to contain exactly one segment but found %d", len(gpx.Tracks[0].Segments))
 	}
 
+	stat, err := os.Stat(dataDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if err := os.MkdirAll(dataDir, 0755); err != nil {
+				return fmt.Errorf("creating data dir at %s: %w", dataDir, err)
+			}
+			log.Printf("created data dir at %s", dataDir)
+		} else {
+			return fmt.Errorf("checking data dir at %s: %w", dataDir, err)
+		}
+	} else if !stat.IsDir() {
+		return fmt.Errorf("data dir at %s is not a directory", dataDir)
+	}
+
 	pts := gpx.Tracks[0].Segments[0].Points
 
+	// TODO(glynternet): can use glynternet gpx package here instead
 	chunkSize := len(pts) / split
 	if chunkSize < 1 {
 		chunkSize = 1
@@ -313,15 +330,10 @@ func mainErr() error {
 	}
 
 	log.Println("points:", len(pts))
-	var splitPoints int64
-	for _, points := range splits {
-		splitPoints += int64(len(points))
-	}
-	log.Println("splits:", len(splits), "points:", splitPoints)
 
-	getPoint, getStats := point()
-	var pois []Point
 	for _, split := range splits {
+		getPoint, getStats := point()
+		var pois []Point
 		for _, query := range queries {
 			locus := 80
 			// check not negative, could also memoize
@@ -338,7 +350,6 @@ func mainErr() error {
 				return fmt.Errorf("getting nodes: %w", err)
 			}
 			log.Println("Retrieved nodes:", len(nodes))
-
 			for _, node := range nodes {
 				pt, err := getPoint(node.Tags, LatLon{
 					Lat: node.Lat,
@@ -349,6 +360,8 @@ func mainErr() error {
 				}
 				pois = append(pois, pt)
 			}
+			log.Println("Total pois:", getStats(0).totalPoints)
+
 			wayCentres, err := wayCentres(query.conditions, aroundRoute)
 			if err != nil {
 				return fmt.Errorf("getting way centres: %w", err)
@@ -362,55 +375,60 @@ func mainErr() error {
 				}
 				pois = append(pois, pt)
 			}
+			log.Println("Total pois:", getStats(0).totalPoints)
 		}
-	}
-	sort.Slice(pois, func(i, j int) bool {
-		if pois[i] == pois[j] {
-			return false
+		sort.Slice(pois, func(i, j int) bool {
+			if pois[i] == pois[j] {
+				return false
+			}
+			if pois[i].Name != pois[j].Name {
+				return pois[i].Name < pois[j].Name
+			}
+			if pois[i].Description != pois[j].Description {
+				return pois[i].Description < pois[j].Description
+			}
+			if pois[i].Symbol != pois[j].Symbol {
+				return pois[i].Symbol < pois[j].Symbol
+			}
+			if pois[i].Lat != pois[j].Lat {
+				return pois[i].Lat < pois[j].Lat
+			}
+			return pois[i].Lon < pois[j].Lon
+		})
+		f, err = os.CreateTemp("", "pois-json")
+		if err != nil {
+			return fmt.Errorf("creating temp file for output: %w", err)
 		}
-		if pois[i].Name != pois[j].Name {
-			return pois[i].Name < pois[j].Name
+		encoder := json.NewEncoder(f)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(pois); err != nil {
+			return fmt.Errorf("writing output json: %w", err)
 		}
-		if pois[i].Description != pois[j].Description {
-			return pois[i].Description < pois[j].Description
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("closing output json file(%s): %w", f.Name(), err)
 		}
-		if pois[i].Symbol != pois[j].Symbol {
-			return pois[i].Symbol < pois[j].Symbol
-		}
-		if pois[i].Lat != pois[j].Lat {
-			return pois[i].Lat < pois[j].Lat
-		}
-		return pois[i].Lon < pois[j].Lon
-	})
 
-	f, err = os.CreateTemp("", "pois-json")
-	if err != nil {
-		return fmt.Errorf("creating temp file for output: %w", err)
-	}
-	encoder := json.NewEncoder(f)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(pois); err != nil {
-		return fmt.Errorf("writing output json: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("closing output json file(%s): %w", f.Name(), err)
-	}
-	const topK = 50
-	stats := getStats(topK)
-	log.Println("top", topK, "tags")
-	for _, tagOccurrence := range stats.tagOccurrences {
-		log.Println("-", tagOccurrence.freq, tagOccurrence.value)
-	}
-	log.Println("top", topK, "tag values")
-	for _, tagValueOccurrence := range stats.tagValueOccurrences {
-		log.Println("-", tagValueOccurrence.freq, tagValueOccurrence.value)
+		if stats := false; stats {
+			const topK = 50
+			stats := getStats(topK)
+			log.Println("top", topK, "tags")
+			for _, tagOccurrence := range stats.tagOccurrences {
+				log.Println("-", tagOccurrence.freq, tagOccurrence.value)
+			}
+			log.Println("top", topK, "tag values")
+			for _, tagValueOccurrence := range stats.tagValueOccurrences {
+				log.Println("-", tagValueOccurrence.freq, tagValueOccurrence.value)
+			}
+		}
+
+		log.Println("output:", f.Name(), "pois:", len(pois))
 	}
 
-	log.Println("output:", f.Name(), "pois:", len(pois))
 	return nil
 }
 
 type stats struct {
+	totalPoints         int
 	tagOccurrences      []valueFreq
 	tagValueOccurrences []valueFreq
 }
@@ -421,6 +439,7 @@ type valueFreq struct {
 }
 
 func point() (func(tags map[string]interface{}, latLon LatLon) (Point, error), func(topK int) stats) {
+	var totalPoints int
 	tagOccurrences := make(map[string]int)
 	tagValueOccurrences := make(map[string]int)
 	return func(tags map[string]interface{}, latLon LatLon) (Point, error) {
@@ -443,6 +462,7 @@ func point() (func(tags map[string]interface{}, latLon LatLon) (Point, error), f
 				Description: string(desc),
 				Symbol:      resolveSymbol(tags),
 			}
+			totalPoints++
 			return nodePoint, nil
 		}, func(topK int) stats {
 			var outputTagOccurrences []valueFreq
@@ -474,6 +494,7 @@ func point() (func(tags map[string]interface{}, latLon LatLon) (Point, error), f
 				outputTagValueOccurrences = outputTagValueOccurrences[:topK]
 			}
 			return stats{
+				totalPoints:         totalPoints,
 				tagOccurrences:      outputTagOccurrences,
 				tagValueOccurrences: outputTagValueOccurrences,
 			}
@@ -630,7 +651,7 @@ func queryResponseElements(queryType string, queryConditions []condition, route 
 	sha := base64.URLEncoding.EncodeToString(hasher.Sum(nil))
 
 	var rc io.ReadCloser
-	queryStateFilePath := filepath.Join(stateHome, sha)
+	queryStateFilePath := filepath.Join(dataDir, sha)
 	if stored, err := os.Open(queryStateFilePath); err == nil {
 		log.Printf("query fetched from cached result: %s", queryStateFilePath)
 		rc = stored
@@ -644,7 +665,7 @@ func queryResponseElements(queryType string, queryConditions []condition, route 
 		if resp.StatusCode != http.StatusOK {
 			_, _ = io.Copy(os.Stderr, resp.Body)
 			_ = resp.Body.Close()
-			return nil, fmt.Errorf("posting query (%s:%s): unexpected status code %d (%s)", queryType, queryConditions, resp.StatusCode, resp.Status)
+			return nil, fmt.Errorf("posting query (%s:%+v): unexpected status code %d (%s)", queryType, queryConditions, resp.StatusCode, resp.Status)
 		}
 		file, err := os.OpenFile(queryStateFilePath, os.O_RDWR|os.O_CREATE, 0666)
 		if err != nil {
