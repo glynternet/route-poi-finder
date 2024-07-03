@@ -269,7 +269,7 @@ type Point struct {
 }
 
 func main() {
-	log.SetFlags(log.Lshortfile)
+	log.SetFlags(log.Ldate | log.Lmicroseconds | log.Lshortfile)
 	if len(os.Args) < 2 {
 		log.Println("must provide args")
 		os.Exit(1)
@@ -334,7 +334,7 @@ func mainErr(file string) error {
 	for _, split := range splits {
 		getPoint, getStats := point()
 		var pois []Point
-		for _, query := range queries {
+		for i, query := range queries {
 			locus := 80
 			// check not negative, could also memoize
 			if query.radius != 0 {
@@ -345,6 +345,7 @@ func mainErr(file string) error {
 				return fmt.Errorf("creating query route component: %w", err)
 			}
 
+			log.Println("Executing query", i, "of", len(queries))
 			nodes, err := nodes(query, aroundRoute)
 			if err != nil {
 				return fmt.Errorf("getting nodes: %w", err)
