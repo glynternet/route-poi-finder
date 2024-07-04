@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -272,18 +273,23 @@ type Point struct {
 
 func main() {
 	log.SetFlags(log.Ldate | log.Lmicroseconds | log.Lshortfile)
-	if len(os.Args) < 2 {
-		log.Println("must provide args")
+	// flags have to go before args
+	// TODO(glynternet): use better flags package
+	namePrefix := flag.String(`name-prefix`, ``, `prefix to place in front of all points`)
+	flag.Parse()
+	args := flag.Args()
+	if len(args) != 1 {
+		log.Println("must provide gpx file arg")
 		os.Exit(1)
 	}
-	if err := mainErr(os.Args[1]); err != nil {
+	if err := mainErr(args[0], *namePrefix); err != nil {
 		log.Println(err.Error())
 		os.Exit(1)
 	}
 	os.Exit(0)
 }
 
-func mainErr(file string) error {
+func mainErr(file string, namePrefix string) error {
 	f, err := os.Open(file)
 	if err != nil {
 		return fmt.Errorf("opening gpx file: %w", err)
@@ -333,7 +339,7 @@ func mainErr(file string) error {
 
 	log.Println("points:", len(pts))
 
-	getPoint, getStats := point()
+	getPoint, getStats := point(namePrefix)
 	var pois []Point
 
 	for splitI, split := range splits {
@@ -449,7 +455,7 @@ type valueFreq struct {
 	freq  int
 }
 
-func point() (func(tags map[string]interface{}, latLon LatLon) (Point, error), func(topK int) stats) {
+func point(namePrefix string) (func(tags map[string]interface{}, latLon LatLon) (Point, error), func(topK int) stats) {
 	var totalPoints int
 	tagOccurrences := make(map[string]int)
 	tagValueOccurrences := make(map[string]int)
@@ -467,7 +473,7 @@ func point() (func(tags map[string]interface{}, latLon LatLon) (Point, error), f
 				tagValueOccurrences[tag+":"+value.(string)]++
 			}
 			nodePoint := Point{
-				Name:        name,
+				Name:        namePrefix + name,
 				Lat:         latLon.Lat,
 				Lon:         latLon.Lon,
 				Description: string(desc),
