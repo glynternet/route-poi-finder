@@ -333,9 +333,10 @@ func mainErr(file string) error {
 
 	log.Println("points:", len(pts))
 
+	getPoint, getStats := point()
+	var pois []Point
+
 	for splitI, split := range splits {
-		getPoint, getStats := point()
-		var pois []Point
 		for i, query := range queries {
 			locus := 80
 			// check not negative, could also memoize
@@ -380,53 +381,60 @@ func mainErr(file string) error {
 			}
 			log.Println("Total pois:", getStats(0).totalPoints)
 		}
-		sort.Slice(pois, func(i, j int) bool {
-			if pois[i] == pois[j] {
-				return false
-			}
-			if pois[i].Name != pois[j].Name {
-				return pois[i].Name < pois[j].Name
-			}
-			if pois[i].Description != pois[j].Description {
-				return pois[i].Description < pois[j].Description
-			}
-			if pois[i].Symbol != pois[j].Symbol {
-				return pois[i].Symbol < pois[j].Symbol
-			}
-			if pois[i].Lat != pois[j].Lat {
-				return pois[i].Lat < pois[j].Lat
-			}
-			return pois[i].Lon < pois[j].Lon
-		})
-		f, err = os.CreateTemp("", "pois-json")
-		if err != nil {
-			return fmt.Errorf("creating temp file for output: %w", err)
-		}
-		encoder := json.NewEncoder(f)
-		encoder.SetIndent("", "  ")
-		if err := encoder.Encode(pois); err != nil {
-			return fmt.Errorf("writing output json: %w", err)
-		}
-		if err := f.Close(); err != nil {
-			return fmt.Errorf("closing output json file(%s): %w", f.Name(), err)
-		}
-
-		if stats := false; stats {
-			const topK = 50
-			stats := getStats(topK)
-			log.Println("top", topK, "tags")
-			for _, tagOccurrence := range stats.tagOccurrences {
-				log.Println("-", tagOccurrence.freq, tagOccurrence.value)
-			}
-			log.Println("top", topK, "tag values")
-			for _, tagValueOccurrence := range stats.tagValueOccurrences {
-				log.Println("-", tagValueOccurrence.freq, tagValueOccurrence.value)
-			}
-		}
-
-		log.Println("output:", f.Name(), "pois:", len(pois))
+	}
+	if err := writePois(pois, getStats); err != nil {
+		return fmt.Errorf("writing pois: %w", err)
 	}
 
+	return nil
+}
+
+func writePois(pois []Point, getStats func(topK int) stats) error {
+	sort.Slice(pois, func(i, j int) bool {
+		if pois[i] == pois[j] {
+			return false
+		}
+		if pois[i].Name != pois[j].Name {
+			return pois[i].Name < pois[j].Name
+		}
+		if pois[i].Description != pois[j].Description {
+			return pois[i].Description < pois[j].Description
+		}
+		if pois[i].Symbol != pois[j].Symbol {
+			return pois[i].Symbol < pois[j].Symbol
+		}
+		if pois[i].Lat != pois[j].Lat {
+			return pois[i].Lat < pois[j].Lat
+		}
+		return pois[i].Lon < pois[j].Lon
+	})
+	f, err := os.CreateTemp("", "pois-json")
+	if err != nil {
+		return fmt.Errorf("creating temp file for output: %w", err)
+	}
+	encoder := json.NewEncoder(f)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(pois); err != nil {
+		return fmt.Errorf("writing output json: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("closing output json file(%s): %w", f.Name(), err)
+	}
+
+	if stats := false; stats {
+		const topK = 50
+		stats := getStats(topK)
+		log.Println("top", topK, "tags")
+		for _, tagOccurrence := range stats.tagOccurrences {
+			log.Println("-", tagOccurrence.freq, tagOccurrence.value)
+		}
+		log.Println("top", topK, "tag values")
+		for _, tagValueOccurrence := range stats.tagValueOccurrences {
+			log.Println("-", tagValueOccurrence.freq, tagValueOccurrence.value)
+		}
+	}
+
+	log.Println("output:", f.Name(), "pois:", len(pois))
 	return nil
 }
 
