@@ -21,7 +21,9 @@ import (
 const (
 	dataDir = `/tmp/route-poi-finder-state`
 
-	split = 1
+	split = 10
+
+	debug = false
 )
 
 const (
@@ -331,7 +333,7 @@ func mainErr(file string) error {
 
 	log.Println("points:", len(pts))
 
-	for _, split := range splits {
+	for splitI, split := range splits {
 		getPoint, getStats := point()
 		var pois []Point
 		for i, query := range queries {
@@ -345,7 +347,7 @@ func mainErr(file string) error {
 				return fmt.Errorf("creating query route component: %w", err)
 			}
 
-			log.Println("Executing query", i, "of", len(queries))
+			log.Println("Split:", splitI, "executing query", i, "of", len(queries))
 			nodes, err := nodes(query, aroundRoute)
 			if err != nil {
 				return fmt.Errorf("getting nodes: %w", err)
@@ -654,7 +656,9 @@ func queryResponseElements(queryType string, queryConditions []condition, route 
 	var rc io.ReadCloser
 	queryStateFilePath := filepath.Join(dataDir, sha)
 	if stored, err := os.Open(queryStateFilePath); err == nil {
-		log.Printf("query fetched from cached result: %s", queryStateFilePath)
+		if debug {
+			log.Printf("query fetched from cached result: %s", queryStateFilePath)
+		}
 		rc = stored
 	} else if os.IsNotExist(err) {
 		log.Printf("query result not cached, making query to API: %s:%+v", queryType, queryConditions)
@@ -675,7 +679,9 @@ func queryResponseElements(queryType string, queryConditions []condition, route 
 		if _, err := io.Copy(file, resp.Body); err != nil {
 			return nil, fmt.Errorf("outputing response body: %w", err)
 		}
-		log.Printf("query result written: %s", file.Name())
+		if debug {
+			log.Printf("query result written: %s", file.Name())
+		}
 		if err := resp.Body.Close(); err != nil {
 			return nil, fmt.Errorf("closing response body: %w", err)
 		}
