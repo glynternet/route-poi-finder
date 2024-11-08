@@ -357,7 +357,7 @@ func mainErr(file string, namePrefix string, split uint) error {
 				return fmt.Errorf("creating query route component: %w", err)
 			}
 
-			log.Println("Split:", splitI, "executing query", i, "of", len(queries))
+			log.Println("Split", splitI+1, "of", len(splits), "executing query", i+1, "of", len(queries))
 			nodes, err := nodes(query, aroundRoute)
 			if err != nil {
 				return fmt.Errorf("getting nodes: %w", err)
