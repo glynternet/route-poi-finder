@@ -22,8 +22,6 @@ import (
 const (
 	dataDir = `/tmp/route-poi-finder-state`
 
-	split = 10
-
 	debug = false
 )
 
@@ -276,20 +274,25 @@ func main() {
 	// flags have to go before args
 	// TODO(glynternet): use better flags package
 	namePrefix := flag.String(`name-prefix`, ``, `prefix to place in front of all points`)
+	split := flag.Uint(`split`, 5, `number of segments to split track into for querying overpass API`)
 	flag.Parse()
 	args := flag.Args()
 	if len(args) != 1 {
 		log.Println("must provide gpx file arg")
 		os.Exit(1)
 	}
-	if err := mainErr(args[0], *namePrefix); err != nil {
+	if err := mainErr(args[0], *namePrefix, *split); err != nil {
 		log.Println(err.Error())
 		os.Exit(1)
 	}
 	os.Exit(0)
 }
 
-func mainErr(file string, namePrefix string) error {
+func mainErr(file string, namePrefix string, split uint) error {
+	if split == 0 {
+		return fmt.Errorf("--split must be greater than 0")
+	}
+
 	f, err := os.Open(file)
 	if err != nil {
 		return fmt.Errorf("opening gpx file: %w", err)
@@ -324,7 +327,7 @@ func mainErr(file string, namePrefix string) error {
 	pts := gpx.Tracks[0].Segments[0].Points
 
 	// TODO(glynternet): can use glynternet gpx package here instead
-	chunkSize := len(pts) / split
+	chunkSize := len(pts) / int(split)
 	if chunkSize < 1 {
 		chunkSize = 1
 	}
