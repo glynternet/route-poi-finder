@@ -9,12 +9,14 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	gpxgo "github.com/tkrajina/gpxgo/gpx"
 )
@@ -359,10 +361,14 @@ func mainErr(file string, namePrefix string, split uint) error {
 	log.Println("points:", len(pts))
 
 	getPoint, getStats := point(namePrefix)
-	var pois []Point
+	pois := make(map[Point]struct{})
 
+	queryPointCounts := make(occurrences[string])
+
+	executeQuery := elementQuerier()
 	for splitI, split := range splits {
 		for i, query := range queries {
+			humanFriendlyQueryConditions := fmt.Sprintf("%+v", query.conditions)
 			locus := 80
 			// check not negative, could also memoize
 			if query.radius != 0 {
@@ -374,7 +380,7 @@ func mainErr(file string, namePrefix string, split uint) error {
 			}
 
 			log.Println("Split", splitI+1, "of", len(splits), "executing query", i+1, "of", len(queries))
-			nodes, err := nodes(query, aroundRoute)
+			nodes, err := nodes(executeQuery, query.conditions, aroundRoute)
 			if err != nil {
 				return fmt.Errorf("getting nodes: %w", err)
 			}
@@ -387,11 +393,15 @@ func mainErr(file string, namePrefix string, split uint) error {
 				if err != nil {
 					return fmt.Errorf("getting point for node(%v): %w", node, err)
 				}
-				pois = append(pois, pt)
+				pois[pt] = struct{}{}
+				// always mark because we want to stats to represent the raw number of points returned by each query.
+				// we could mark separately the number of points that come up duplicated across multiple segements/splits
+				// but I'm not sure that's worth it, tbh.
+				queryPointCounts.mark(humanFriendlyQueryConditions)
 			}
 			log.Println("Total pois:", getStats(0).totalPoints)
 
-			wayCentres, err := wayCentres(query.conditions, aroundRoute)
+			wayCentres, err := wayCentres(executeQuery, query.conditions, aroundRoute)
 			if err != nil {
 				return fmt.Errorf("getting way centres: %w", err)
 			}
@@ -402,13 +412,30 @@ func mainErr(file string, namePrefix string, split uint) error {
 				if err != nil {
 					return fmt.Errorf("getting point for way(%v): %w", wayCentre, err)
 				}
-				pois = append(pois, pt)
+				pois[pt] = struct{}{}
+				// always mark because we want to stats to represent the raw number of points returned by each query.
+				// we could mark separately the number of points that come up duplicated across multiple segements/splits
+				// but I'm not sure that's worth it, tbh.
+				queryPointCounts.mark(humanFriendlyQueryConditions)
 			}
 			log.Println("Total pois:", getStats(0).totalPoints)
 		}
 	}
 	if err := writePois(pois, getStats); err != nil {
 		return fmt.Errorf("writing pois: %w", err)
+	}
+
+	stats := getStats(20)
+	for _, occurrence := range stats.tagOccurrences {
+		log.Println("Tag:", occurrence.value, "=>", occurrence.freq)
+	}
+	for _, occurrence := range stats.tagValueOccurrences {
+		log.Println("Tag-Value:", occurrence.value, "=>", occurrence.freq)
+	}
+
+	topQueryCounts := queryPointCounts.topK(20)
+	for _, q := range topQueryCounts {
+		log.Println("Query:", q.value, "=>", q.freq)
 	}
 
 	return nil
@@ -465,19 +492,47 @@ func writePois(pois []Point, getStats func(topK int) stats) error {
 
 type stats struct {
 	totalPoints         int
-	tagOccurrences      []valueFreq
-	tagValueOccurrences []valueFreq
+	tagOccurrences      []valueFreq[string]
+	tagValueOccurrences []valueFreq[string]
 }
 
-type valueFreq struct {
-	value string
+type valueFreq[T comparable] struct {
+	value T
 	freq  int
+}
+
+type occurrences[T comparable] map[T]int
+
+func (os occurrences[T]) mark(v T) {
+	os[v]++
+}
+
+func (os occurrences[T]) markN(v T, n int) {
+	os[v] += n
+}
+
+func (os occurrences[T]) topK(k int) []valueFreq[T] {
+	var vfs []valueFreq[T]
+	for tag, freq := range os {
+		vfs = append(vfs, valueFreq[T]{
+			value: tag,
+			freq:  freq,
+		})
+	}
+	sort.Slice(vfs, func(i, j int) bool {
+		// descending
+		return vfs[i].freq > vfs[j].freq
+	})
+	if len(vfs) > k {
+		vfs = vfs[:k]
+	}
+	return vfs
 }
 
 func point(namePrefix string) (func(tags map[string]interface{}, latLon LatLon) (Point, error), func(topK int) stats) {
 	var totalPoints int
-	tagOccurrences := make(map[string]int)
-	tagValueOccurrences := make(map[string]int)
+	tagOccurrences := make(occurrences[string])
+	tagValueOccurrences := make(occurrences[string])
 	return func(tags map[string]interface{}, latLon LatLon) (Point, error) {
 			name, err := resolveName(tags)
 			if err != nil {
@@ -488,8 +543,11 @@ func point(namePrefix string) (func(tags map[string]interface{}, latLon LatLon) 
 				return Point{}, fmt.Errorf("marshalling node tags for description: %w", err)
 			}
 			for tag, value := range tags {
-				tagOccurrences[tag]++
-				tagValueOccurrences[tag+":"+value.(string)]++
+				tagOccurrences.mark(tag)
+				tagValueOccurrences.mark(tag + ":" + value.(string))
+				if tag == "waterway" {
+					log.Printf("%+v", tags)
+				}
 			}
 			nodePoint := Point{
 				Name:        namePrefix + name,
@@ -501,38 +559,10 @@ func point(namePrefix string) (func(tags map[string]interface{}, latLon LatLon) 
 			totalPoints++
 			return nodePoint, nil
 		}, func(topK int) stats {
-			var outputTagOccurrences []valueFreq
-			for tag, freq := range tagOccurrences {
-				outputTagOccurrences = append(outputTagOccurrences, valueFreq{
-					value: tag,
-					freq:  freq,
-				})
-			}
-			sort.Slice(outputTagOccurrences, func(i, j int) bool {
-				// descending
-				return outputTagOccurrences[i].freq > outputTagOccurrences[j].freq
-			})
-			if len(outputTagOccurrences) > topK {
-				outputTagOccurrences = outputTagOccurrences[:topK]
-			}
-			var outputTagValueOccurrences []valueFreq
-			for tagValue, freq := range tagValueOccurrences {
-				outputTagValueOccurrences = append(outputTagValueOccurrences, valueFreq{
-					value: tagValue,
-					freq:  freq,
-				})
-			}
-			sort.Slice(outputTagValueOccurrences, func(i, j int) bool {
-				return outputTagValueOccurrences[i].freq > outputTagValueOccurrences[j].freq
-			})
-			// descending
-			if len(outputTagValueOccurrences) > topK {
-				outputTagValueOccurrences = outputTagValueOccurrences[:topK]
-			}
 			return stats{
 				totalPoints:         totalPoints,
-				tagOccurrences:      outputTagOccurrences,
-				tagValueOccurrences: outputTagValueOccurrences,
+				tagOccurrences:      tagOccurrences.topK(topK),
+				tagValueOccurrences: tagValueOccurrences.topK(topK),
 			}
 		}
 }
@@ -576,8 +606,8 @@ out meta;`); err != nil {
 	return sb.String(), nil
 }
 
-func nodes(elements query, aroundRoute string) ([]element, error) {
-	responseElements, err := queryResponseElements(`node`, elements.conditions, aroundRoute)
+func nodes(makeQuery func(string, []condition, string) ([]element, error), conditions []condition, aroundRoute string) ([]element, error) {
+	responseElements, err := makeQuery(`node`, conditions, aroundRoute)
 	if err != nil {
 		return nil, fmt.Errorf("getting query response elements: %w", err)
 	}
@@ -591,8 +621,8 @@ func nodes(elements query, aroundRoute string) ([]element, error) {
 	return responseElements, nil
 }
 
-func wayCentres(conditions []condition, route string) ([]wayCentre, error) {
-	responseElements, err := queryResponseElements(`way`, conditions, route)
+func wayCentres(makeQuery func(string, []condition, string) ([]element, error), conditions []condition, route string) ([]wayCentre, error) {
+	responseElements, err := makeQuery(`way`, conditions, route)
 	if err != nil {
 		return nil, fmt.Errorf("getting query response elements: %w", err)
 	}
@@ -634,7 +664,72 @@ func wayCentres(conditions []condition, route string) ([]wayCentre, error) {
 	return wayCentres, nil
 }
 
-func queryResponseElements(queryType string, queryConditions []condition, route string) ([]element, error) {
+func elementQuerier() func(queryType string, queryConditions []condition, route string) ([]element, error) {
+	return func(queryType string, queryConditions []condition, route string) ([]element, error) {
+		humanFriendlyQueryConditions := fmt.Sprintf("%+v", queryConditions)
+		renderedQuery, elements, err := buildQuery(queryType, queryConditions, route)
+		if err != nil {
+			return elements, err
+		}
+		if debug {
+			log.Printf("query (%s) build from conditions (%+v) and type (%s)", renderedQuery, queryConditions, queryType)
+		}
+		hasher := sha1.New()
+		if _, err := hasher.Write([]byte(renderedQuery)); err != nil {
+			return nil, fmt.Errorf("hashing query: %w", err)
+		}
+		sha := base64.URLEncoding.EncodeToString(hasher.Sum(nil))
+
+		var rc io.ReadCloser
+		queryStateFilePath := filepath.Join(dataDir, sha)
+		if stored, err := os.Open(queryStateFilePath); err == nil {
+			if debug {
+				log.Printf("query fetched from cached result: %s", queryStateFilePath)
+			}
+			rc = stored
+		} else if os.IsNotExist(err) {
+			log.Printf("query result not cached, making query to API: %s", humanFriendlyQueryConditions)
+			resp, err := doQuery(renderedQuery)
+			if err != nil {
+				return nil, err
+			}
+			file, err := os.OpenFile(queryStateFilePath, os.O_RDWR|os.O_CREATE, 0666)
+			if err != nil {
+				_ = resp.Close()
+				return nil, fmt.Errorf("opening query file for writing(%s): %w", humanFriendlyQueryConditions, err)
+			}
+			// TODO(glynternet): can we use a TeeReader here instead?
+			if _, err := io.Copy(file, resp); err != nil {
+				_ = resp.Close()
+				return nil, fmt.Errorf("outputing response: %w", err)
+			}
+			if debug {
+				log.Printf("query result written: %s", file.Name())
+			}
+			if err := resp.Close(); err != nil {
+				return nil, fmt.Errorf("closing response: %w", err)
+			}
+			if _, err := file.Seek(0, io.SeekStart); err != nil {
+				return nil, fmt.Errorf("seeking to start of query response state file: %w", err)
+			}
+			rc = file
+		} else if err != nil {
+			return nil, fmt.Errorf("opening query state file(%s): %w", queryStateFilePath, err)
+		}
+
+		var r response
+		if err := json.NewDecoder(rc).Decode(&r); err != nil {
+			_ = rc.Close()
+			return nil, fmt.Errorf("decoding response body: %w", err)
+		}
+		if err := rc.Close(); err != nil {
+			return nil, fmt.Errorf("closing response body: %w", err)
+		}
+		return r.Elements, nil
+	}
+}
+
+func buildQuery(queryType string, queryConditions []condition, route string) (string, []element, error) {
 	var sb strings.Builder
 	sb.WriteString(`[out:json];` + queryType)
 	for _, element := range queryConditions {
@@ -649,7 +744,7 @@ func queryResponseElements(queryType string, queryConditions []condition, route 
 			}
 		}
 		if definedConditions > 1 {
-			return nil, fmt.Errorf("query element must contain only one condition: 'not', 'values' or 'exists': %+v", element)
+			return "", nil, fmt.Errorf("query element must contain only one condition: 'not', 'values' or 'exists': %+v", element)
 		}
 		var elementConditions []string
 		switch {
@@ -666,75 +761,49 @@ func queryResponseElements(queryType string, queryConditions []condition, route 
 			case ExistsNo:
 				elementConditions = []string{fmt.Sprintf(`!%s`, element.tag)}
 			default:
-				return nil, fmt.Errorf("unsupported exists value: %+v", element.exists)
+				return "", nil, fmt.Errorf("unsupported exists value: %+v", element.exists)
 			}
 		default:
-			return nil, fmt.Errorf("query element contains no conditions: %+v", element)
+			return "", nil, fmt.Errorf("query element contains no conditions: %+v", element)
 		}
 		for _, elementCondition := range elementConditions {
 			if _, err := sb.WriteString(`[` + elementCondition + `]`); err != nil {
-				return nil, fmt.Errorf("writing query element: %w", err)
+				return "", nil, fmt.Errorf("writing query element: %w", err)
 			}
 		}
 	}
 	sb.WriteString(route)
 
 	renderedQuery := sb.String()
-	hasher := sha1.New()
-	if _, err := hasher.Write([]byte(renderedQuery)); err != nil {
-		return nil, fmt.Errorf("hashing query: %w", err)
-	}
-	sha := base64.URLEncoding.EncodeToString(hasher.Sum(nil))
+	return renderedQuery, nil, nil
+}
 
-	var rc io.ReadCloser
-	queryStateFilePath := filepath.Join(dataDir, sha)
-	if stored, err := os.Open(queryStateFilePath); err == nil {
-		if debug {
-			log.Printf("query fetched from cached result: %s", queryStateFilePath)
-		}
-		rc = stored
-	} else if os.IsNotExist(err) {
-		log.Printf("query result not cached, making query to API: %s:%+v", queryType, queryConditions)
+func doQuery(renderedQuery string) (io.ReadCloser, error) {
+	var resp *http.Response
+	for attempt := 1; ; attempt++ {
 		// curl -d @<(cat <(echo "[out:json];$type$params") ~/tmp/pois/query_end) -X POST http://overpass-api.de/api/interpreter
-		resp, err := http.Post(`http://overpass-api.de/api/interpreter`, "", strings.NewReader(renderedQuery))
-		if err != nil {
-			return nil, fmt.Errorf("posting query(%+v): %w", queryConditions, err)
+		var err error
+		resp, err = http.Post(`http://overpass-api.de/api/interpreter`, "", strings.NewReader(renderedQuery))
+		if err == nil {
+			switch resp.StatusCode {
+			case http.StatusOK:
+				return resp.Body, nil
+			case http.StatusTooManyRequests:
+				err = errors.New("rate limited")
+			default:
+				_, _ = io.Copy(os.Stderr, resp.Body)
+				_ = resp.Body.Close()
+				return nil, fmt.Errorf("posting query (%s): unexpected status code %d (%s)", renderedQuery, resp.StatusCode, resp.Status)
+			}
 		}
-		if resp.StatusCode != http.StatusOK {
-			_, _ = io.Copy(os.Stderr, resp.Body)
-			_ = resp.Body.Close()
-			return nil, fmt.Errorf("posting query (%s:%+v): unexpected status code %d (%s)", queryType, queryConditions, resp.StatusCode, resp.Status)
+		const maxAttempts = 50
+		if attempt >= maxAttempts {
+			return nil, fmt.Errorf("posting query(%s), too many retries: %w", renderedQuery, err)
 		}
-		file, err := os.OpenFile(queryStateFilePath, os.O_RDWR|os.O_CREATE, 0666)
-		if err != nil {
-			return nil, fmt.Errorf("opening query file for writing(%+v): %w", queryConditions, err)
-		}
-		if _, err := io.Copy(file, resp.Body); err != nil {
-			return nil, fmt.Errorf("outputing response body: %w", err)
-		}
-		if debug {
-			log.Printf("query result written: %s", file.Name())
-		}
-		if err := resp.Body.Close(); err != nil {
-			return nil, fmt.Errorf("closing response body: %w", err)
-		}
-		if _, err := file.Seek(0, io.SeekStart); err != nil {
-			return nil, fmt.Errorf("seeking to start of query response state file: %w", err)
-		}
-		rc = file
-	} else if err != nil {
-		return nil, fmt.Errorf("opening query state file(%s): %w", queryStateFilePath, err)
+		waitDuration := time.Second * time.Duration(float64(2)*math.Pow(1.5, 1.0+float64(attempt)/float64(maxAttempts)))
+		log.Printf("Error executing query (attempt %d/%d), will retry in %s: %s", attempt, maxAttempts, waitDuration.String(), err.Error())
+		time.Sleep(waitDuration)
 	}
-
-	var r response
-	if err := json.NewDecoder(rc).Decode(&r); err != nil {
-		_ = rc.Close()
-		return nil, fmt.Errorf("decoding response body: %w", err)
-	}
-	if err := rc.Close(); err != nil {
-		return nil, fmt.Errorf("closing response body: %w", err)
-	}
-	return r.Elements, nil
 }
 
 func resolveName(tags map[string]interface{}) (string, error) {
@@ -746,8 +815,8 @@ func resolveName(tags map[string]interface{}) (string, error) {
 		"shop",
 		"waterway",
 		"natural",
-		// probably good to combine this with another tag
-		"boundary",
+		"boundary", // probably good to combine this with another tag
+		"man_made",
 	} {
 		n, ok := tags[tag].(string)
 		if ok {
