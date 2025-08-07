@@ -45,26 +45,34 @@ type condition struct {
 }
 
 var queries = []query{{
+	radius: 1000,
 	conditions: []condition{{
 		tag: "amenity",
 		values: []string{
 			"bar",
-			"bicycle_rental",
-			"bicycle_repair_station",
-			"bicycle_wash",
 			"biergarten",
 			"cafe",
-			"compressed_air",
 			"fast_food",
 			"food_court",
 			"fountain",
 			"fuel",
 			"ice_cream",
 			"marketplace",
-			"place_of_worship",
 			"pub",
-			"public_bath",
 			"restaurant",
+		},
+	}},
+}, {
+	radius: 500,
+	conditions: []condition{{
+		tag: "amenity",
+		values: []string{
+			"bicycle_rental",
+			"bicycle_repair_station",
+			"bicycle_wash",
+			"compressed_air",
+			"place_of_worship",
+			"public_bath",
 			"shelter",
 			"shower",
 			"toilets",
@@ -81,6 +89,7 @@ var queries = []query{{
 		},
 	}},
 }, {
+	radius: 200,
 	conditions: []condition{{
 		// - - tourism~"^(alpine_hut|camp_pitch|camp_site|guest_house|hostel|picnic_site|viewpoint|wilderness_hut)$"
 		tag: "tourism",
@@ -90,9 +99,16 @@ var queries = []query{{
 			"camp_site",
 			"guest_house",
 			"hostel",
+			"wilderness_hut",
+		},
+	}},
+}, {
+	conditions: []condition{{
+		// - - tourism~"^(alpine_hut|camp_pitch|camp_site|guest_house|hostel|picnic_site|viewpoint|wilderness_hut)$"
+		tag: "tourism",
+		values: []string{
 			"picnic_site",
 			"viewpoint",
-			"wilderness_hut",
 		},
 	}},
 }, {
@@ -123,7 +139,7 @@ var queries = []query{{
 	}},
 }, {
 	conditions: []condition{{
-		// boundary=aboriginal_lands
+		//boundary=aboriginal_lands
 		//boundary=national_park
 		//boundary=forest
 		//boundary=water_protection_area
@@ -138,7 +154,7 @@ var queries = []query{{
 		},
 	}},
 }, {
-	radius: 200,
+	radius: 1000,
 	conditions: []condition{{
 		// - - man_made~"^(spring_box|water_well|water_tap)$"
 		tag: "man_made",
@@ -150,7 +166,7 @@ var queries = []query{{
 		},
 	}},
 }, {
-	radius: 200,
+	radius: 1000,
 	conditions: []condition{{
 		tag: "drinking_water",
 		values: []string{
@@ -199,6 +215,7 @@ var queries = []query{{
 		notValues: []string{"no"},
 	}},
 }, {
+	radius: 2000,
 	conditions: []condition{{
 		tag: "shop",
 		values: []string{
