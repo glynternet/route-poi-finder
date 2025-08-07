@@ -399,7 +399,10 @@ func mainErr(file string, namePrefix string, split uint) error {
 			if err != nil {
 				return fmt.Errorf("getting nodes: %w", err)
 			}
-			log.Println("Retrieved nodes:", len(nodes))
+
+			if count := len(nodes) > 0; count {
+				log.Println("Retrieved nodes:", count)
+			}
 			for _, node := range nodes {
 				if err := collectPoint(humanFriendlyQueryConditions, node.Tags, LatLon{
 					Lat: node.Lat,
@@ -414,8 +417,10 @@ func mainErr(file string, namePrefix string, split uint) error {
 			if err != nil {
 				return fmt.Errorf("getting way centres: %w", err)
 			}
-			log.Println("Retrieved way centres:", len(wayCentres))
 
+			if count := len(wayCentres) > 0; count {
+				log.Println("Retrieved way centres:", count)
+			}
 			for _, wayCentre := range wayCentres {
 				if err := collectPoint(humanFriendlyQueryConditions, wayCentre.Tags, wayCentre.Centre); err != nil {
 					return fmt.Errorf("collecting point for wayCentre(%v): %w", wayCentre, err)
@@ -549,9 +554,6 @@ func point(namePrefix string) (func(tags map[string]interface{}, latLon LatLon) 
 			for tag, value := range tags {
 				tagOccurrences.mark(tag)
 				tagValueOccurrences.mark(tag + ":" + value.(string))
-				if tag == "waterway" {
-					log.Printf("%+v", tags)
-				}
 			}
 			nodePoint := Point{
 				Name:        namePrefix + name,
