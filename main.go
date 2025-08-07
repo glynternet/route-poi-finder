@@ -39,7 +39,6 @@ type query struct {
 
 type condition struct {
 	tag       string
-	distance  int
 	values    []string
 	notValues []string
 	exists    int
