@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
@@ -9,10 +10,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"math"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -362,8 +365,20 @@ func mainErr(file string, namePrefix string, split uint) error {
 
 	getPoint, getStats := point(namePrefix)
 	pois := make(map[Point]struct{})
-
 	queryPointCounts := make(occurrences[string])
+
+	collectPoint := func(humanFriendlyQueryConditions string, tags map[string]interface{}, ll LatLon) error {
+		pt, err := getPoint(tags, ll)
+		if err != nil {
+			return fmt.Errorf("getting point for tags(%v) and LatLon(%v): %w", tags, ll, err)
+		}
+		pois[pt] = struct{}{}
+		// always mark because we want to stats to represent the raw number of points returned by each query.
+		// we could mark separately the number of points that come up duplicated across multiple segements/splits
+		// but I'm not sure that's worth it, tbh.
+		queryPointCounts.mark(humanFriendlyQueryConditions)
+		return nil
+	}
 
 	executeQuery := elementQuerier()
 	for splitI, split := range splits {
@@ -386,18 +401,12 @@ func mainErr(file string, namePrefix string, split uint) error {
 			}
 			log.Println("Retrieved nodes:", len(nodes))
 			for _, node := range nodes {
-				pt, err := getPoint(node.Tags, LatLon{
+				if err := collectPoint(humanFriendlyQueryConditions, node.Tags, LatLon{
 					Lat: node.Lat,
 					Lon: node.Lon,
-				})
-				if err != nil {
-					return fmt.Errorf("getting point for node(%v): %w", node, err)
+				}); err != nil {
+					return fmt.Errorf("collecting point for node(%v): %w", node, err)
 				}
-				pois[pt] = struct{}{}
-				// always mark because we want to stats to represent the raw number of points returned by each query.
-				// we could mark separately the number of points that come up duplicated across multiple segements/splits
-				// but I'm not sure that's worth it, tbh.
-				queryPointCounts.mark(humanFriendlyQueryConditions)
 			}
 			log.Println("Total pois:", getStats(0).totalPoints)
 
@@ -408,15 +417,9 @@ func mainErr(file string, namePrefix string, split uint) error {
 			log.Println("Retrieved way centres:", len(wayCentres))
 
 			for _, wayCentre := range wayCentres {
-				pt, err := getPoint(wayCentre.Tags, wayCentre.Centre)
-				if err != nil {
-					return fmt.Errorf("getting point for way(%v): %w", wayCentre, err)
+				if err := collectPoint(humanFriendlyQueryConditions, wayCentre.Tags, wayCentre.Centre); err != nil {
+					return fmt.Errorf("collecting point for wayCentre(%v): %w", wayCentre, err)
 				}
-				pois[pt] = struct{}{}
-				// always mark because we want to stats to represent the raw number of points returned by each query.
-				// we could mark separately the number of points that come up duplicated across multiple segements/splits
-				// but I'm not sure that's worth it, tbh.
-				queryPointCounts.mark(humanFriendlyQueryConditions)
 			}
 			log.Println("Total pois:", getStats(0).totalPoints)
 		}
@@ -441,32 +444,33 @@ func mainErr(file string, namePrefix string, split uint) error {
 	return nil
 }
 
-func writePois(pois []Point, getStats func(topK int) stats) error {
-	sort.Slice(pois, func(i, j int) bool {
-		if pois[i] == pois[j] {
-			return false
-		}
-		if pois[i].Name != pois[j].Name {
-			return pois[i].Name < pois[j].Name
-		}
-		if pois[i].Description != pois[j].Description {
-			return pois[i].Description < pois[j].Description
-		}
-		if pois[i].Symbol != pois[j].Symbol {
-			return pois[i].Symbol < pois[j].Symbol
-		}
-		if pois[i].Lat != pois[j].Lat {
-			return pois[i].Lat < pois[j].Lat
-		}
-		return pois[i].Lon < pois[j].Lon
-	})
+func writePois(pois map[Point]struct{}, getStats func(topK int) stats) error {
+	sortedPOIs :=
+		slices.SortedFunc((maps.Keys(pois)), func(i, j Point) int {
+			if i == j {
+				return 0
+			}
+			if i.Name != j.Name {
+				return cmp.Compare(i.Name, j.Name)
+			}
+			if i.Description != j.Description {
+				return cmp.Compare(i.Description, j.Description)
+			}
+			if i.Symbol != j.Symbol {
+				return cmp.Compare(i.Symbol, j.Symbol)
+			}
+			if i.Lat != j.Lat {
+				return cmp.Compare(i.Lat, j.Lat)
+			}
+			return cmp.Compare(i.Lon, j.Lon)
+		})
 	f, err := os.CreateTemp("", "pois-json")
 	if err != nil {
 		return fmt.Errorf("creating temp file for output: %w", err)
 	}
 	encoder := json.NewEncoder(f)
 	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(pois); err != nil {
+	if err := encoder.Encode(sortedPOIs); err != nil {
 		return fmt.Errorf("writing output json: %w", err)
 	}
 	if err := f.Close(); err != nil {
