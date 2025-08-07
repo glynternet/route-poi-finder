@@ -171,7 +171,7 @@ var queries = []query{{
 		},
 	}},
 }, {
-	radius: 1000,
+	radius: 2000,
 	conditions: []condition{{
 		tag: "drinking_water",
 		values: []string{
@@ -179,6 +179,7 @@ var queries = []query{{
 		},
 	}},
 }, {
+	radius: 500,
 	conditions: []condition{{
 		tag:    "waterway",
 		exists: ExistsYes,
@@ -296,20 +297,21 @@ func main() {
 	// TODO(glynternet): use better flags package
 	namePrefix := flag.String(`name-prefix`, ``, `prefix to place in front of all points`)
 	split := flag.Uint(`split`, 5, `number of segments to split track into for querying overpass API`)
+	out := flag.String(`out`, "-", `file to write output to, "-" writes to stdout`)
 	flag.Parse()
 	args := flag.Args()
 	if len(args) != 1 {
 		log.Println("must provide gpx file arg")
 		os.Exit(1)
 	}
-	if err := mainErr(args[0], *namePrefix, *split); err != nil {
+	if err := mainErr(args[0], *namePrefix, *split, *out); err != nil {
 		log.Println(err.Error())
 		os.Exit(1)
 	}
 	os.Exit(0)
 }
 
-func mainErr(file string, namePrefix string, split uint) error {
+func mainErr(file string, namePrefix string, split uint, out string) error {
 	if split == 0 {
 		return fmt.Errorf("--split must be greater than 0")
 	}
@@ -429,8 +431,37 @@ func mainErr(file string, namePrefix string, split uint) error {
 			log.Println("Total pois:", getStats(0).totalPoints)
 		}
 	}
-	if err := writePois(pois, getStats); err != nil {
+	var w io.Writer
+	var wClose func() error
+	switch out {
+	case "":
+		f, err := os.CreateTemp("", "pois-json")
+		if err != nil {
+			return fmt.Errorf("creating temp file for output: %w", err)
+		}
+		w = f
+		wClose = f.Close
+	case "-":
+		w = os.Stdout
+	default:
+		f, err := os.OpenFile(out, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0600)
+		if err != nil {
+			return fmt.Errorf("opening file (%s) for writing: %w", out, err)
+		}
+		w = f
+		wClose = f.Close
+	}
+
+	if err := writePois(pois, getStats, w); err != nil {
+		if wClose != nil {
+			_ = wClose()
+		}
 		return fmt.Errorf("writing pois: %w", err)
+	}
+	if wClose != nil {
+		if err := wClose(); err != nil {
+			return fmt.Errorf("closing output json writer: %w", err)
+		}
 	}
 
 	stats := getStats(20)
@@ -449,7 +480,7 @@ func mainErr(file string, namePrefix string, split uint) error {
 	return nil
 }
 
-func writePois(pois map[Point]struct{}, getStats func(topK int) stats) error {
+func writePois(pois map[Point]struct{}, getStats func(topK int) stats, out io.Writer) error {
 	sortedPOIs :=
 		slices.SortedFunc((maps.Keys(pois)), func(i, j Point) int {
 			if i == j {
@@ -469,17 +500,10 @@ func writePois(pois map[Point]struct{}, getStats func(topK int) stats) error {
 			}
 			return cmp.Compare(i.Lon, j.Lon)
 		})
-	f, err := os.CreateTemp("", "pois-json")
-	if err != nil {
-		return fmt.Errorf("creating temp file for output: %w", err)
-	}
-	encoder := json.NewEncoder(f)
+	encoder := json.NewEncoder(out)
 	encoder.SetIndent("", "  ")
 	if err := encoder.Encode(sortedPOIs); err != nil {
 		return fmt.Errorf("writing output json: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("closing output json file(%s): %w", f.Name(), err)
 	}
 
 	if stats := false; stats {
@@ -495,7 +519,7 @@ func writePois(pois map[Point]struct{}, getStats func(topK int) stats) error {
 		}
 	}
 
-	log.Println("output:", f.Name(), "pois:", len(pois))
+	log.Println("pois:", len(pois))
 	return nil
 }
 
