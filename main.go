@@ -194,6 +194,12 @@ var queries = []query{{
 		},
 	}},
 }, {
+	radius: 250,
+	conditions: []condition{{
+		tag:    "ford",
+		exists: ExistsYes,
+	}},
+}, {
 	conditions: []condition{{
 		// - - place~"^(town|village|hamlet|city|neighbourhood)$"
 		tag: "place",
