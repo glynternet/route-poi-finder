@@ -2,6 +2,7 @@ package main
 
 import (
 	"cmp"
+	"context"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
@@ -11,7 +12,7 @@ import (
 	"io"
 	"log"
 	"maps"
-	"math"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	gpxgo "github.com/tkrajina/gpxgo/gpx"
@@ -297,6 +299,194 @@ type Point struct {
 	Symbol      string  `json:"sym"`
 }
 
+// workUnit represents a single unit of work for the worker pool
+type workUnit struct {
+	splitIndex  int
+	queryIndex  int
+	query       query
+	routePoints []gpxgo.GPXPoint
+}
+
+// workResult contains the results from processing a single work unit
+type workResult struct {
+	splitIndex int
+	queryIndex int
+	nodes      []element
+	wayCentres []wayCentre
+	err        error
+}
+
+// retryConfig holds retry settings
+type retryConfig struct {
+	maxRetries int
+	baseDelay  time.Duration
+	maxDelay   time.Duration
+}
+
+// httpStatusError wraps HTTP status code errors for retry logic
+type httpStatusError struct {
+	statusCode int
+	status     string
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("unexpected status code %d (%s)", e.statusCode, e.status)
+}
+
+// isRetryableError determines if an error should trigger a retry
+func isRetryableError(err error) bool {
+	// Network errors are retryable
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+
+	// Check for HTTP status code errors
+	var httpErr *httpStatusError
+	if errors.As(err, &httpErr) {
+		return httpErr.statusCode >= 500 || httpErr.statusCode == 429
+	}
+
+	return false
+}
+
+func retrier[T any](conf retryConfig) func(ctx context.Context, queryFn func() (T, error)) (T, error) {
+	return func(ctx context.Context, queryFn func() (T, error)) (T, error) {
+		var result T
+		var lastErr error
+
+		for attempt := 0; attempt <= conf.maxRetries; attempt++ {
+			if attempt > 0 {
+				delay := conf.baseDelay * time.Duration(1<<(attempt-1))
+				if delay > conf.maxDelay {
+					delay = conf.maxDelay
+				}
+
+				select {
+				case <-ctx.Done():
+					return result, ctx.Err()
+				case <-time.After(delay):
+				}
+
+				log.Printf("Retry attempt %d/%d after error: %v", attempt, conf.maxRetries, lastErr)
+			}
+
+			result, lastErr = queryFn()
+			if lastErr == nil {
+				return result, nil
+			}
+
+			// Only retry on transient errors
+			if !isRetryableError(lastErr) {
+				return result, lastErr
+			}
+		}
+
+		return result, fmt.Errorf("max retries (%d) exceeded: %w", conf.maxRetries, lastErr)
+	}
+}
+
+// concurrentUnitsWorker returns a function that processes units concurrently
+// using a pool of workers. The processUnit function is called for each unit.
+func concurrentUnitsWorker[Unit any, Result any](
+	workerCount int,
+	processUnit func(unit Unit) Result,
+) func(units ...Unit) []Result {
+	return func(units ...Unit) []Result {
+		jobs := make(chan Unit)
+		results := make(chan Result)
+
+		var wg sync.WaitGroup
+		for i := 0; i < workerCount; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for unit := range jobs {
+					results <- processUnit(unit)
+				}
+			}()
+		}
+
+		go func() {
+			for _, unit := range units {
+				jobs <- unit
+			}
+			close(jobs)
+		}()
+
+		go func() {
+			wg.Wait()
+			close(results)
+		}()
+
+		var allResults []Result
+		for result := range results {
+			allResults = append(allResults, result)
+		}
+
+		return allResults
+	}
+}
+
+// unitProcessor returns a function that processes a single work unit,
+// querying the Overpass API for nodes and way centres with retry support.
+func unitProcessor(
+	ctx context.Context,
+	makeQuery func(string, []condition, string) ([]element, error),
+	queryElementsWithRetry func(ctx context.Context, queryFn func() ([]element, error)) ([]element, error),
+	queryWayCentresWithRetry func(ctx context.Context, queryFn func() ([]wayCentre, error)) ([]wayCentre, error),
+) func(unit workUnit) workResult {
+	return func(unit workUnit) workResult {
+		locus := 80
+		if unit.query.radius != 0 {
+			locus = unit.query.radius
+		}
+
+		aroundRoute, err := queryRouteComponent(locus, unit.routePoints)
+		if err != nil {
+			return workResult{
+				splitIndex: unit.splitIndex,
+				queryIndex: unit.queryIndex,
+				err:        fmt.Errorf("creating query route component: %w", err),
+			}
+		}
+
+		log.Printf("Worker processing split %d, query %d", unit.splitIndex+1, unit.queryIndex+1)
+
+		nodeElements, err := queryElementsWithRetry(ctx, func() ([]element, error) {
+			return nodes(makeQuery, unit.query.conditions, aroundRoute)
+		})
+		if err != nil {
+			return workResult{
+				splitIndex: unit.splitIndex,
+				queryIndex: unit.queryIndex,
+				err:        fmt.Errorf("getting nodes: %w", err),
+			}
+		}
+
+		wayCentreElements, err := queryWayCentresWithRetry(ctx, func() ([]wayCentre, error) {
+			return wayCentres(makeQuery, unit.query.conditions, aroundRoute)
+		})
+		if err != nil {
+			return workResult{
+				splitIndex: unit.splitIndex,
+				queryIndex: unit.queryIndex,
+				err:        fmt.Errorf("getting way centres: %w", err),
+			}
+		}
+
+		log.Printf("Split %d, query %d: %d nodes, %d way centres",
+			unit.splitIndex+1, unit.queryIndex+1, len(nodeElements), len(wayCentreElements))
+
+		return workResult{
+			splitIndex: unit.splitIndex,
+			queryIndex: unit.queryIndex,
+			nodes:      nodeElements,
+			wayCentres: wayCentreElements,
+		}
+	}
+}
+
 func main() {
 	log.SetFlags(log.Ldate | log.Lmicroseconds | log.Lshortfile)
 	// flags have to go before args
@@ -304,20 +494,32 @@ func main() {
 	namePrefix := flag.String(`name-prefix`, ``, `prefix to place in front of all points`)
 	split := flag.Uint(`split`, 5, `number of segments to split track into for querying overpass API`)
 	out := flag.String(`out`, "-", `file to write output to, "-" writes to stdout`)
+	workers := flag.Int(`workers`, 3, `number of concurrent workers for API requests`)
+	retries := flag.Int(`retries`, 5, `number of retries per API request on transient failures`)
 	flag.Parse()
+
+	if *workers < 1 {
+		log.Println("--workers must be at least 1")
+		os.Exit(1)
+	}
+	if *retries < 0 {
+		log.Println("--retries must be at least 0")
+		os.Exit(1)
+	}
+
 	args := flag.Args()
 	if len(args) != 1 {
 		log.Println("must provide gpx file arg")
 		os.Exit(1)
 	}
-	if err := mainErr(args[0], *namePrefix, *split, *out); err != nil {
+	if err := mainErr(args[0], *namePrefix, *split, *workers, *retries, *out); err != nil {
 		log.Println(err.Error())
 		os.Exit(1)
 	}
 	os.Exit(0)
 }
 
-func mainErr(file string, namePrefix string, split uint, out string) error {
+func mainErr(file string, namePrefix string, split uint, workers int, retries int, out string) error {
 	if split == 0 {
 		return fmt.Errorf("--split must be greater than 0")
 	}
@@ -326,10 +528,13 @@ func mainErr(file string, namePrefix string, split uint, out string) error {
 	if err != nil {
 		return fmt.Errorf("opening gpx file: %w", err)
 	}
-
 	gpx, err := gpxgo.Parse(f)
 	if err != nil {
+		_ = f.Close()
 		return fmt.Errorf("parsing gpx file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("closing gpx file: %w", err)
 	}
 
 	if len(gpx.Tracks) != 1 {
@@ -371,72 +576,75 @@ func mainErr(file string, namePrefix string, split uint, out string) error {
 
 	log.Println("points:", len(pts))
 
+	var workUnits []workUnit
+	for splitI, splitPoints := range splits {
+		for queryI, q := range queries {
+			workUnits = append(workUnits, workUnit{
+				splitIndex:  splitI,
+				queryIndex:  queryI,
+				query:       q,
+				routePoints: splitPoints,
+			})
+		}
+	}
+
+	log.Printf("Processing %d work units with %d workers", len(workUnits), workers)
+
+	ctx := context.Background()
+	retryConf := retryConfig{
+		maxRetries: retries,
+		baseDelay:  5 * time.Second,
+		maxDelay:   60 * time.Second,
+	}
+	executeQuery := elementQuerier()
+	processUnits := concurrentUnitsWorker(workers, unitProcessor(ctx, executeQuery, retrier[[]element](retryConf), retrier[[]wayCentre](retryConf)))
+	results := processUnits(workUnits...)
+
+	slices.SortFunc(results, func(a, b workResult) int {
+		if c := cmp.Compare(a.splitIndex, b.splitIndex); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.queryIndex, b.queryIndex)
+	})
+
+	// Check for errors and collect POIs (sequential - no mutex needed)
 	getPoint, getStats := point(namePrefix)
 	pois := make(map[Point]struct{})
 	queryPointCounts := make(occurrences[string])
+	var errs []error
 
-	collectPoint := func(humanFriendlyQueryConditions string, tags map[string]interface{}, ll LatLon) error {
-		pt, err := getPoint(tags, ll)
-		if err != nil {
-			return fmt.Errorf("getting point for tags(%v) and LatLon(%v): %w", tags, ll, err)
+	for _, result := range results {
+		if result.err != nil {
+			errs = append(errs, fmt.Errorf("split %d query %d: %w",
+				result.splitIndex+1, result.queryIndex+1, result.err))
+			continue
 		}
-		pois[pt] = struct{}{}
-		// always mark because we want to stats to represent the raw number of points returned by each query.
-		// we could mark separately the number of points that come up duplicated across multiple segements/splits
-		// but I'm not sure that's worth it, tbh.
-		queryPointCounts.mark(humanFriendlyQueryConditions)
-		return nil
-	}
 
-	executeQuery := elementQuerier()
-	for splitI, split := range splits {
-		for i, query := range queries {
-			humanFriendlyQueryConditions := fmt.Sprintf("%+v", query.conditions)
-			locus := 80
-			// check not negative, could also memoize
-			if query.radius != 0 {
-				locus = query.radius
-			}
-			aroundRoute, err := queryRouteComponent(locus, split)
+		humanFriendlyQueryConditions := fmt.Sprintf("%+v", queries[result.queryIndex].conditions)
+
+		for _, node := range result.nodes {
+			pt, err := getPoint(node.Tags, LatLon{Lat: node.Lat, Lon: node.Lon})
 			if err != nil {
-				return fmt.Errorf("creating query route component: %w", err)
+				return fmt.Errorf("getting point for node(%v): %w", node, err)
 			}
+			pois[pt] = struct{}{}
+			queryPointCounts.mark(humanFriendlyQueryConditions)
+		}
 
-			log.Println("Split", splitI+1, "of", len(splits), "executing query", i+1, "of", len(queries))
-			nodes, err := nodes(executeQuery, query.conditions, aroundRoute)
+		for _, wc := range result.wayCentres {
+			pt, err := getPoint(wc.Tags, wc.Centre)
 			if err != nil {
-				return fmt.Errorf("getting nodes: %w", err)
+				return fmt.Errorf("getting point for way(%v): %w", wc, err)
 			}
-
-			if count := len(nodes) > 0; count {
-				log.Println("Retrieved nodes:", count)
-			}
-			for _, node := range nodes {
-				if err := collectPoint(humanFriendlyQueryConditions, node.Tags, LatLon{
-					Lat: node.Lat,
-					Lon: node.Lon,
-				}); err != nil {
-					return fmt.Errorf("collecting point for node(%v): %w", node, err)
-				}
-			}
-			log.Println("Total pois:", getStats(0).totalPoints)
-
-			wayCentres, err := wayCentres(executeQuery, query.conditions, aroundRoute)
-			if err != nil {
-				return fmt.Errorf("getting way centres: %w", err)
-			}
-
-			if count := len(wayCentres) > 0; count {
-				log.Println("Retrieved way centres:", count)
-			}
-			for _, wayCentre := range wayCentres {
-				if err := collectPoint(humanFriendlyQueryConditions, wayCentre.Tags, wayCentre.Centre); err != nil {
-					return fmt.Errorf("collecting point for wayCentre(%v): %w", wayCentre, err)
-				}
-			}
-			log.Println("Total pois:", getStats(0).totalPoints)
+			pois[pt] = struct{}{}
+			queryPointCounts.mark(humanFriendlyQueryConditions)
 		}
 	}
+
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+
 	var w io.Writer
 	var wClose func() error
 	switch out {
@@ -815,31 +1023,15 @@ func buildQuery(queryType string, queryConditions []condition, route string) (st
 }
 
 func doQuery(renderedQuery string) (io.ReadCloser, error) {
-	var resp *http.Response
-	for attempt := 1; ; attempt++ {
-		// curl -d @<(cat <(echo "[out:json];$type$params") ~/tmp/pois/query_end) -X POST http://overpass-api.de/api/interpreter
-		var err error
-		resp, err = http.Post(`http://overpass-api.de/api/interpreter`, "", strings.NewReader(renderedQuery))
-		if err == nil {
-			switch resp.StatusCode {
-			case http.StatusOK:
-				return resp.Body, nil
-			case http.StatusTooManyRequests:
-				err = errors.New("rate limited")
-			default:
-				_, _ = io.Copy(os.Stderr, resp.Body)
-				_ = resp.Body.Close()
-				return nil, fmt.Errorf("posting query (%s): unexpected status code %d (%s)", renderedQuery, resp.StatusCode, resp.Status)
-			}
-		}
-		const maxAttempts = 50
-		if attempt >= maxAttempts {
-			return nil, fmt.Errorf("posting query(%s), too many retries: %w", renderedQuery, err)
-		}
-		waitDuration := time.Second * time.Duration(float64(2)*math.Pow(1.5, 1.0+float64(attempt)/float64(maxAttempts)))
-		log.Printf("Error executing query (attempt %d/%d), will retry in %s: %s", attempt, maxAttempts, waitDuration.String(), err.Error())
-		time.Sleep(waitDuration)
+	resp, err := http.Post(`http://overpass-api.de/api/interpreter`, "", strings.NewReader(renderedQuery))
+	if err != nil {
+		return nil, fmt.Errorf("posting query: %w", err)
 	}
+	if resp.StatusCode != http.StatusOK {
+		_ = resp.Body.Close()
+		return nil, &httpStatusError{statusCode: resp.StatusCode, status: resp.Status}
+	}
+	return resp.Body, nil
 }
 
 func resolveName(tags map[string]interface{}) (string, error) {
@@ -853,6 +1045,7 @@ func resolveName(tags map[string]interface{}) (string, error) {
 		"natural",
 		"boundary", // probably good to combine this with another tag
 		"man_made",
+		"drinking_water",
 	} {
 		n, ok := tags[tag].(string)
 		if ok {
