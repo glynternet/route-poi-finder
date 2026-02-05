@@ -313,7 +313,6 @@ type workResult struct {
 	queryIndex int
 	nodes      []element
 	wayCentres []wayCentre
-	err        error
 }
 
 // retryConfig holds retry settings
@@ -388,13 +387,23 @@ func retrier[T any](conf retryConfig) func(ctx context.Context, queryFn func() (
 
 // concurrentUnitsWorker returns a function that processes units concurrently
 // using a pool of workers. The processUnit function is called for each unit.
+// If failFast is true, processing stops on the first error.
+// If failFast is false, all errors are collected and returned joined.
 func concurrentUnitsWorker[Unit any, Result any](
 	workerCount int,
-	processUnit func(unit Unit) Result,
-) func(units ...Unit) []Result {
-	return func(units ...Unit) []Result {
+	processUnit func(unit Unit) (Result, error),
+	failFast bool,
+) func(units ...Unit) ([]Result, error) {
+	type resultOrError struct {
+		result Result
+		err    error
+	}
+
+	return func(units ...Unit) ([]Result, error) {
 		jobs := make(chan Unit)
-		results := make(chan Result)
+		results := make(chan resultOrError)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
 		var wg sync.WaitGroup
 		for i := 0; i < workerCount; i++ {
@@ -402,14 +411,28 @@ func concurrentUnitsWorker[Unit any, Result any](
 			go func() {
 				defer wg.Done()
 				for unit := range jobs {
-					results <- processUnit(unit)
+					select {
+					case <-ctx.Done():
+						return
+					default:
+					}
+					result, err := processUnit(unit)
+					select {
+					case <-ctx.Done():
+						return
+					case results <- resultOrError{result, err}:
+					}
 				}
 			}()
 		}
 
 		go func() {
 			for _, unit := range units {
-				jobs <- unit
+				select {
+				case <-ctx.Done():
+					break
+				case jobs <- unit:
+				}
 			}
 			close(jobs)
 		}()
@@ -420,11 +443,27 @@ func concurrentUnitsWorker[Unit any, Result any](
 		}()
 
 		var allResults []Result
-		for result := range results {
-			allResults = append(allResults, result)
+		var errs []error
+		var firstErr error
+
+		for r := range results {
+			if r.err != nil {
+				if !failFast {
+					errs = append(errs, r.err)
+				} else if firstErr == nil {
+					firstErr = r.err
+					cancel()
+					// Continue draining to allow workers to finish
+				}
+				continue
+			}
+			allResults = append(allResults, r.result)
 		}
 
-		return allResults
+		if firstErr != nil {
+			return allResults, firstErr
+		}
+		return allResults, errors.Join(errs...)
 	}
 }
 
@@ -435,8 +474,8 @@ func unitProcessor(
 	makeQuery func(string, []condition, string) ([]element, error),
 	queryElementsWithRetry func(ctx context.Context, queryFn func() ([]element, error)) ([]element, error),
 	queryWayCentresWithRetry func(ctx context.Context, queryFn func() ([]wayCentre, error)) ([]wayCentre, error),
-) func(unit workUnit) workResult {
-	return func(unit workUnit) workResult {
+) func(unit workUnit) (workResult, error) {
+	return func(unit workUnit) (workResult, error) {
 		locus := 80
 		if unit.query.radius != 0 {
 			locus = unit.query.radius
@@ -444,11 +483,8 @@ func unitProcessor(
 
 		aroundRoute, err := queryRouteComponent(locus, unit.routePoints)
 		if err != nil {
-			return workResult{
-				splitIndex: unit.splitIndex,
-				queryIndex: unit.queryIndex,
-				err:        fmt.Errorf("creating query route component: %w", err),
-			}
+			return workResult{}, fmt.Errorf("split %d query %d: creating query route component: %w",
+				unit.splitIndex+1, unit.queryIndex+1, err)
 		}
 
 		log.Printf("Worker processing split %d, query %d", unit.splitIndex+1, unit.queryIndex+1)
@@ -457,22 +493,16 @@ func unitProcessor(
 			return nodes(makeQuery, unit.query.conditions, aroundRoute)
 		})
 		if err != nil {
-			return workResult{
-				splitIndex: unit.splitIndex,
-				queryIndex: unit.queryIndex,
-				err:        fmt.Errorf("getting nodes: %w", err),
-			}
+			return workResult{}, fmt.Errorf("split %d query %d: getting nodes: %w",
+				unit.splitIndex+1, unit.queryIndex+1, err)
 		}
 
 		wayCentreElements, err := queryWayCentresWithRetry(ctx, func() ([]wayCentre, error) {
 			return wayCentres(makeQuery, unit.query.conditions, aroundRoute)
 		})
 		if err != nil {
-			return workResult{
-				splitIndex: unit.splitIndex,
-				queryIndex: unit.queryIndex,
-				err:        fmt.Errorf("getting way centres: %w", err),
-			}
+			return workResult{}, fmt.Errorf("split %d query %d: getting way centres: %w",
+				unit.splitIndex+1, unit.queryIndex+1, err)
 		}
 
 		log.Printf("Split %d, query %d: %d nodes, %d way centres",
@@ -483,7 +513,7 @@ func unitProcessor(
 			queryIndex: unit.queryIndex,
 			nodes:      nodeElements,
 			wayCentres: wayCentreElements,
-		}
+		}, nil
 	}
 }
 
@@ -496,6 +526,7 @@ func main() {
 	out := flag.String(`out`, "-", `file to write output to, "-" writes to stdout`)
 	workers := flag.Int(`workers`, 3, `number of concurrent workers for API requests`)
 	retries := flag.Int(`retries`, 5, `number of retries per API request on transient failures`)
+	failFast := flag.Bool(`fail-fast`, true, `stop processing on first API error`)
 	flag.Parse()
 
 	if *workers < 1 {
@@ -512,14 +543,14 @@ func main() {
 		log.Println("must provide gpx file arg")
 		os.Exit(1)
 	}
-	if err := mainErr(args[0], *namePrefix, *split, *workers, *retries, *out); err != nil {
+	if err := mainErr(args[0], *namePrefix, *split, *workers, *retries, *failFast, *out); err != nil {
 		log.Println(err.Error())
 		os.Exit(1)
 	}
 	os.Exit(0)
 }
 
-func mainErr(file string, namePrefix string, split uint, workers int, retries int, out string) error {
+func mainErr(file string, namePrefix string, split uint, workers int, retries int, failFast bool, out string) error {
 	if split == 0 {
 		return fmt.Errorf("--split must be greater than 0")
 	}
@@ -597,8 +628,11 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 		maxDelay:   60 * time.Second,
 	}
 	executeQuery := elementQuerier()
-	processUnits := concurrentUnitsWorker(workers, unitProcessor(ctx, executeQuery, retrier[[]element](retryConf), retrier[[]wayCentre](retryConf)))
-	results := processUnits(workUnits...)
+	processUnits := concurrentUnitsWorker(workers, unitProcessor(ctx, executeQuery, retrier[[]element](retryConf), retrier[[]wayCentre](retryConf)), failFast)
+	results, err := processUnits(workUnits...)
+	if err != nil {
+		return err
+	}
 
 	slices.SortFunc(results, func(a, b workResult) int {
 		if c := cmp.Compare(a.splitIndex, b.splitIndex); c != 0 {
@@ -607,19 +641,12 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 		return cmp.Compare(a.queryIndex, b.queryIndex)
 	})
 
-	// Check for errors and collect POIs (sequential - no mutex needed)
+	// Collect POIs (sequential - no mutex needed)
 	getPoint, getStats := point(namePrefix)
 	pois := make(map[Point]struct{})
 	queryPointCounts := make(occurrences[string])
-	var errs []error
 
 	for _, result := range results {
-		if result.err != nil {
-			errs = append(errs, fmt.Errorf("split %d query %d: %w",
-				result.splitIndex+1, result.queryIndex+1, result.err))
-			continue
-		}
-
 		humanFriendlyQueryConditions := fmt.Sprintf("%+v", queries[result.queryIndex].conditions)
 
 		for _, node := range result.nodes {
@@ -639,10 +666,6 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 			pois[pt] = struct{}{}
 			queryPointCounts.mark(humanFriendlyQueryConditions)
 		}
-	}
-
-	if len(errs) > 0 {
-		return errors.Join(errs...)
 	}
 
 	var w io.Writer
