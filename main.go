@@ -472,7 +472,7 @@ func concurrentUnitsWorker[Unit any, Result any](
 // querying the Overpass API for nodes and way centres with retry support.
 func unitProcessor(
 	ctx context.Context,
-	makeQuery func(string, []condition, string) ([]element, error),
+	queryClient func(ctx context.Context, query string) (*http.Response, error),
 	queryElementsWithRetry func(ctx context.Context, queryFn func() ([]element, error)) ([]element, error),
 	queryWayCentresWithRetry func(ctx context.Context, queryFn func() ([]wayCentre, error)) ([]wayCentre, error),
 ) func(unit workUnit) (workResult, error) {
@@ -491,7 +491,7 @@ func unitProcessor(
 		log.Printf("Worker processing split %d, query %d", unit.splitIndex+1, unit.queryIndex+1)
 
 		nodeElements, err := queryElementsWithRetry(ctx, func() ([]element, error) {
-			return nodes(makeQuery, unit.query.conditions, aroundRoute)
+			return nodes(ctx, queryClient, unit.query.conditions, aroundRoute)
 		})
 		if err != nil {
 			return workResult{}, fmt.Errorf("split %d query %d: getting nodes: %w",
@@ -499,7 +499,7 @@ func unitProcessor(
 		}
 
 		wayCentreElements, err := queryWayCentresWithRetry(ctx, func() ([]wayCentre, error) {
-			return wayCentres(makeQuery, unit.query.conditions, aroundRoute)
+			return wayCentres(ctx, queryClient, unit.query.conditions, aroundRoute)
 		})
 		if err != nil {
 			return workResult{}, fmt.Errorf("split %d query %d: getting way centres: %w",
@@ -556,16 +556,20 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 		return fmt.Errorf("--split must be greater than 0")
 	}
 
+	ctx := context.Background()
+
+	// Create and start the rate-limited Overpass client
+	client := overpass.NewClient(
+		"https://overpass-api.de/api/interpreter",
+		"https://overpass-api.de/api/status",
+	)
+	if err := client.Start(ctx); err != nil {
+		return fmt.Errorf("starting overpass client: %w", err)
+	}
+	defer client.Close()
+
 	if workers == 0 {
-		fetchStatus := overpass.StatusFetcher("https://overpass-api.de/api/status")
-		status, err := fetchStatus()
-		if err != nil {
-			return fmt.Errorf("fetching overpass status: %w", err)
-		}
-		if status.RateLimit < 1 {
-			return fmt.Errorf("overpass status rate limit returned invalid limit, expected at least 1, got %d", status.RateLimit)
-		}
-		workers = status.RateLimit
+		workers = client.RateLimit()
 		log.Printf("Auto-detected %d workers from API rate limit", workers)
 	}
 
@@ -635,14 +639,12 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 
 	log.Printf("Processing %d work units with %d workers", len(workUnits), workers)
 
-	ctx := context.Background()
 	retryConf := retryConfig{
 		maxRetries: retries,
 		baseDelay:  5 * time.Second,
 		maxDelay:   60 * time.Second,
 	}
-	executeQuery := elementQuerier()
-	processUnits := concurrentUnitsWorker(workers, unitProcessor(ctx, executeQuery, retrier[[]element](retryConf), retrier[[]wayCentre](retryConf)), failFast)
+	processUnits := concurrentUnitsWorker(workers, unitProcessor(ctx, client.Query, retrier[[]element](retryConf), retrier[[]wayCentre](retryConf)), failFast)
 	results, err := processUnits(workUnits...)
 	if err != nil {
 		return err
@@ -887,8 +889,13 @@ out meta;`); err != nil {
 	return sb.String(), nil
 }
 
-func nodes(makeQuery func(string, []condition, string) ([]element, error), conditions []condition, aroundRoute string) ([]element, error) {
-	responseElements, err := makeQuery(`node`, conditions, aroundRoute)
+func nodes(
+	ctx context.Context,
+	queryClient func(ctx context.Context, query string) (*http.Response, error),
+	conditions []condition,
+	route string,
+) ([]element, error) {
+	responseElements, err := queryResponseElements(ctx, queryClient, `node`, conditions, route)
 	if err != nil {
 		return nil, fmt.Errorf("getting query response elements: %w", err)
 	}
@@ -902,8 +909,13 @@ func nodes(makeQuery func(string, []condition, string) ([]element, error), condi
 	return responseElements, nil
 }
 
-func wayCentres(makeQuery func(string, []condition, string) ([]element, error), conditions []condition, route string) ([]wayCentre, error) {
-	responseElements, err := makeQuery(`way`, conditions, route)
+func wayCentres(
+	ctx context.Context,
+	queryClient func(ctx context.Context, query string) (*http.Response, error),
+	conditions []condition,
+	route string,
+) ([]wayCentre, error) {
+	responseElements, err := queryResponseElements(ctx, queryClient, `way`, conditions, route)
 	if err != nil {
 		return nil, fmt.Errorf("getting query response elements: %w", err)
 	}
@@ -945,72 +957,13 @@ func wayCentres(makeQuery func(string, []condition, string) ([]element, error), 
 	return wayCentres, nil
 }
 
-func elementQuerier() func(queryType string, queryConditions []condition, route string) ([]element, error) {
-	return func(queryType string, queryConditions []condition, route string) ([]element, error) {
-		humanFriendlyQueryConditions := fmt.Sprintf("%+v", queryConditions)
-		renderedQuery, elements, err := buildQuery(queryType, queryConditions, route)
-		if err != nil {
-			return elements, err
-		}
-		if debug {
-			log.Printf("query (%s) build from conditions (%+v) and type (%s)", renderedQuery, queryConditions, queryType)
-		}
-		hasher := sha1.New()
-		if _, err := hasher.Write([]byte(renderedQuery)); err != nil {
-			return nil, fmt.Errorf("hashing query: %w", err)
-		}
-		sha := base64.URLEncoding.EncodeToString(hasher.Sum(nil))
-
-		var rc io.ReadCloser
-		queryStateFilePath := filepath.Join(dataDir, sha)
-		if stored, err := os.Open(queryStateFilePath); err == nil {
-			if debug {
-				log.Printf("query fetched from cached result: %s", queryStateFilePath)
-			}
-			rc = stored
-		} else if os.IsNotExist(err) {
-			log.Printf("query result not cached, making query to API: %s", humanFriendlyQueryConditions)
-			resp, err := doQuery(renderedQuery)
-			if err != nil {
-				return nil, err
-			}
-			file, err := os.OpenFile(queryStateFilePath, os.O_RDWR|os.O_CREATE, 0666)
-			if err != nil {
-				_ = resp.Close()
-				return nil, fmt.Errorf("opening query file for writing(%s): %w", humanFriendlyQueryConditions, err)
-			}
-			// TODO(glynternet): can we use a TeeReader here instead?
-			if _, err := io.Copy(file, resp); err != nil {
-				_ = resp.Close()
-				return nil, fmt.Errorf("outputing response: %w", err)
-			}
-			if debug {
-				log.Printf("query result written: %s", file.Name())
-			}
-			if err := resp.Close(); err != nil {
-				return nil, fmt.Errorf("closing response: %w", err)
-			}
-			if _, err := file.Seek(0, io.SeekStart); err != nil {
-				return nil, fmt.Errorf("seeking to start of query response state file: %w", err)
-			}
-			rc = file
-		} else if err != nil {
-			return nil, fmt.Errorf("opening query state file(%s): %w", queryStateFilePath, err)
-		}
-
-		var r response
-		if err := json.NewDecoder(rc).Decode(&r); err != nil {
-			_ = rc.Close()
-			return nil, fmt.Errorf("decoding response body: %w", err)
-		}
-		if err := rc.Close(); err != nil {
-			return nil, fmt.Errorf("closing response body: %w", err)
-		}
-		return r.Elements, nil
-	}
-}
-
-func buildQuery(queryType string, queryConditions []condition, route string) (string, []element, error) {
+func queryResponseElements(
+	ctx context.Context,
+	makeQueryRequest func(ctx context.Context, query string) (*http.Response, error),
+	queryType string,
+	queryConditions []condition,
+	route string,
+) ([]element, error) {
 	var sb strings.Builder
 	sb.WriteString(`[out:json];` + queryType)
 	for _, element := range queryConditions {
@@ -1025,7 +978,7 @@ func buildQuery(queryType string, queryConditions []condition, route string) (st
 			}
 		}
 		if definedConditions > 1 {
-			return "", nil, fmt.Errorf("query element must contain only one condition: 'not', 'values' or 'exists': %+v", element)
+			return nil, fmt.Errorf("query element must contain only one condition: 'not', 'values' or 'exists': %+v", element)
 		}
 		var elementConditions []string
 		switch {
@@ -1042,33 +995,79 @@ func buildQuery(queryType string, queryConditions []condition, route string) (st
 			case ExistsNo:
 				elementConditions = []string{fmt.Sprintf(`!%s`, element.tag)}
 			default:
-				return "", nil, fmt.Errorf("unsupported exists value: %+v", element.exists)
+				return nil, fmt.Errorf("unsupported exists value: %+v", element.exists)
 			}
 		default:
-			return "", nil, fmt.Errorf("query element contains no conditions: %+v", element)
+			return nil, fmt.Errorf("query element contains no conditions: %+v", element)
 		}
 		for _, elementCondition := range elementConditions {
 			if _, err := sb.WriteString(`[` + elementCondition + `]`); err != nil {
-				return "", nil, fmt.Errorf("writing query element: %w", err)
+				return nil, fmt.Errorf("writing query element: %w", err)
 			}
 		}
 	}
 	sb.WriteString(route)
 
 	renderedQuery := sb.String()
-	return renderedQuery, nil, nil
-}
 
-func doQuery(renderedQuery string) (io.ReadCloser, error) {
-	resp, err := http.Post(`http://overpass-api.de/api/interpreter`, "", strings.NewReader(renderedQuery))
-	if err != nil {
-		return nil, fmt.Errorf("posting query: %w", err)
+	hasher := sha1.New()
+	if _, err := hasher.Write([]byte(renderedQuery)); err != nil {
+		return nil, fmt.Errorf("hashing query: %w", err)
 	}
-	if resp.StatusCode != http.StatusOK {
-		_ = resp.Body.Close()
-		return nil, &httpStatusError{statusCode: resp.StatusCode, status: resp.Status}
+	sha := base64.URLEncoding.EncodeToString(hasher.Sum(nil))
+
+	var rc io.ReadCloser
+	queryStateFilePath := filepath.Join(dataDir, sha)
+	if stored, err := os.Open(queryStateFilePath); err == nil {
+		if debug {
+			log.Printf("query fetched from cached result: %s", queryStateFilePath)
+		}
+		rc = stored
+	} else if os.IsNotExist(err) {
+		log.Printf("query result not cached, making query to API: %s:%+v", queryType, queryConditions)
+		resp, err := makeQueryRequest(ctx, renderedQuery)
+		if err != nil {
+			return nil, fmt.Errorf("posting query(%+v): %w", queryConditions, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			_ = resp.Body.Close()
+			return nil, &httpStatusError{statusCode: resp.StatusCode, status: resp.Status}
+		}
+		file, err := os.OpenFile(queryStateFilePath, os.O_RDWR|os.O_CREATE, 0666)
+		if err != nil {
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("opening query file for writing(%+v): %w", queryConditions, err)
+		}
+		if _, err := io.Copy(file, resp.Body); err != nil {
+			_ = resp.Body.Close()
+			_ = file.Close()
+			return nil, fmt.Errorf("outputting response body: %w", err)
+		}
+		if debug {
+			log.Printf("query result written: %s", file.Name())
+		}
+		if err := resp.Body.Close(); err != nil {
+			_ = file.Close()
+			return nil, fmt.Errorf("closing response body: %w", err)
+		}
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			_ = file.Close()
+			return nil, fmt.Errorf("seeking to start of query response state file: %w", err)
+		}
+		rc = file
+	} else if err != nil {
+		return nil, fmt.Errorf("opening query state file(%s): %w", queryStateFilePath, err)
 	}
-	return resp.Body, nil
+
+	var r response
+	if err := json.NewDecoder(rc).Decode(&r); err != nil {
+		_ = rc.Close()
+		return nil, fmt.Errorf("decoding response body: %w", err)
+	}
+	if err := rc.Close(); err != nil {
+		return nil, fmt.Errorf("closing response body: %w", err)
+	}
+	return r.Elements, nil
 }
 
 func resolveName(tags map[string]interface{}) (string, error) {

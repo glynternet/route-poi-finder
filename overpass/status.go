@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -12,8 +14,9 @@ import (
 
 // Status holds parsed status from the Overpass API status endpoint
 type Status struct {
-	RateLimit    int
-	AvailableNow int
+	RateLimit     int
+	AvailableNow  int
+	NextSlotWaits []time.Duration // sorted ascending
 }
 
 // StatusFetcher returns a function that fetches and parses the current status from the Overpass API
@@ -33,6 +36,9 @@ func StatusFetcher(endpoint string) func() (Status, error) {
 		return parseStatusResponse(resp.Body)
 	}
 }
+
+// slotWaitRegex matches lines like "Slot available after: 2024-01-15T10:30:45Z, in 5 seconds."
+var slotWaitRegex = regexp.MustCompile(`Slot available after: .+, in (\d+) seconds\.`)
 
 // parseStatusResponse parses the text response from /api/status endpoint
 func parseStatusResponse(r io.Reader) (Status, error) {
@@ -59,11 +65,25 @@ func parseStatusResponse(r io.Reader) (Status, error) {
 			if err == nil {
 				status.AvailableNow = n
 			}
+			continue
+		}
+
+		// Parse "Slot available after: ..., in N seconds."
+		if matches := slotWaitRegex.FindStringSubmatch(line); len(matches) == 2 {
+			seconds, err := strconv.Atoi(matches[1])
+			if err == nil {
+				status.NextSlotWaits = append(status.NextSlotWaits, time.Duration(seconds)*time.Second)
+			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return Status{}, fmt.Errorf("scanning status response: %w", err)
 	}
+
+	// Sort wait times ascending
+	sort.Slice(status.NextSlotWaits, func(i, j int) bool {
+		return status.NextSlotWaits[i] < status.NextSlotWaits[j]
+	})
 
 	return status, nil
 }
