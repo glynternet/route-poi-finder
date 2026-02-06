@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/glynternet/route-poi-finder/overpass"
 	gpxgo "github.com/tkrajina/gpxgo/gpx"
 )
 
@@ -524,13 +525,13 @@ func main() {
 	namePrefix := flag.String(`name-prefix`, ``, `prefix to place in front of all points`)
 	split := flag.Uint(`split`, 5, `number of segments to split track into for querying overpass API`)
 	out := flag.String(`out`, "-", `file to write output to, "-" writes to stdout`)
-	workers := flag.Int(`workers`, 3, `number of concurrent workers for API requests`)
+	workers := flag.Int(`workers`, 0, `number of concurrent workers for API requests (0=auto-detect from API rate limit)`)
 	retries := flag.Int(`retries`, 5, `number of retries per API request on transient failures`)
 	failFast := flag.Bool(`fail-fast`, true, `stop processing on first API error`)
 	flag.Parse()
 
-	if *workers < 1 {
-		log.Println("--workers must be at least 1")
+	if *workers < 0 {
+		log.Println("--workers must be at least 0")
 		os.Exit(1)
 	}
 	if *retries < 0 {
@@ -553,6 +554,19 @@ func main() {
 func mainErr(file string, namePrefix string, split uint, workers int, retries int, failFast bool, out string) error {
 	if split == 0 {
 		return fmt.Errorf("--split must be greater than 0")
+	}
+
+	if workers == 0 {
+		fetchStatus := overpass.StatusFetcher("https://overpass-api.de/api/status")
+		status, err := fetchStatus()
+		if err != nil {
+			return fmt.Errorf("fetching overpass status: %w", err)
+		}
+		if status.RateLimit < 1 {
+			return fmt.Errorf("overpass status rate limit returned invalid limit, expected at least 1, got %d", status.RateLimit)
+		}
+		workers = status.RateLimit
+		log.Printf("Auto-detected %d workers from API rate limit", workers)
 	}
 
 	f, err := os.Open(file)

@@ -36,6 +36,6 @@ Single-file Go CLI tool (`main.go`) that finds Points of Interest along GPS rout
 **Key flags:**
 - `--split` - Number of route segments for API queries (default 5)
 - `--name-prefix` - Prefix for all POI names in output
-- `--workers` - Number of concurrent workers for API requests (default 3)
+- `--workers` - Number of concurrent workers for API requests (default 0=auto-detect from API rate limit)
 - `--retries` - Number of retries per API request on transient failures (default 5)
 - `--fail-fast` - Stop processing on first API error (default true, use `--fail-fast=false` to collect all errors)
