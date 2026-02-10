@@ -980,7 +980,11 @@ func queryResponseElements(
 	route string,
 ) ([]element, error) {
 	var sb strings.Builder
-	sb.WriteString(`[out:json];` + queryType)
+	// timeout:120 tells the Overpass server to abort after 120s, matching our
+	// HTTP client timeout. Without this, the server default is 180s, meaning a
+	// query can keep running (and occupying a rate-limit slot) after the client
+	// has timed out and potentially retried with a new request.
+	sb.WriteString(`[out:json][timeout:120];` + queryType)
 	for _, element := range queryConditions {
 		var definedConditions int
 		for _, condition := range []bool{
