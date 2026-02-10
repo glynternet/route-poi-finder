@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -120,11 +121,15 @@ func (c *Client) Query(ctx context.Context, query string) (*http.Response, error
 		return nil, errors.New("client closed")
 	}
 
-	// Make the actual request
-	req, err := http.NewRequestWithContext(ctx, "POST", c.interpreterEndpoint, strings.NewReader(query))
+	// Make the actual request.
+	// The Overpass API expects POST bodies as form-encoded "data=<query>".
+	// Without explicit Content-Type, the server must guess the body format.
+	body := strings.NewReader(url.Values{"data": {query}}.Encode())
+	req, err := http.NewRequestWithContext(ctx, "POST", c.interpreterEndpoint, body)
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	// Overpass API usage policy expects clients to identify themselves.
 	// Requests without User-Agent may be deprioritised by the server.
 	req.Header.Set("User-Agent", "route-poi-finder")
