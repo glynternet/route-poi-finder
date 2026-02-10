@@ -138,7 +138,7 @@ var queries = []query{{
 			"mountain_range",
 			"ridge",
 			"arete",
-			"hot spring",
+			"hot_spring", // OSM tags use underscores, not spaces
 			"plateau",
 			"saddle",
 		},
