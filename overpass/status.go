@@ -23,7 +23,15 @@ type Status struct {
 func StatusFetcher(endpoint string) func() (Status, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	return func() (Status, error) {
-		resp, err := client.Get(endpoint)
+		req, err := http.NewRequest("GET", endpoint, nil)
+		if err != nil {
+			return Status{}, fmt.Errorf("creating status request: %w", err)
+		}
+		// Overpass API identifies users by IP; status and query endpoints
+		// are counted together for rate-limiting, so both should identify
+		// the application.
+		req.Header.Set("User-Agent", "route-poi-finder")
+		resp, err := client.Do(req)
 		if err != nil {
 			return Status{}, fmt.Errorf("fetching status: %w", err)
 		}
