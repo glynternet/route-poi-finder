@@ -889,9 +889,11 @@ func queryRouteComponent(locus int, route []gpxgo.GPXPoint) (string, error) {
 			return "", fmt.Errorf(`writing query route component: %w`, err)
 		}
 	}
+	// "out body" returns tags and geometry without the version/changeset/timestamp/user
+	// metadata that "out meta" includes. We don't use any of that metadata.
 	if _, err := sb.WriteString(`);
 (._;>;);
-out meta;`); err != nil {
+out body;`); err != nil {
 		return "", fmt.Errorf(`writing query route component: %w`, err)
 	}
 	return sb.String(), nil
