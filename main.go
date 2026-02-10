@@ -891,9 +891,11 @@ func queryRouteComponent(locus int, route []gpxgo.GPXPoint) (string, error) {
 	}
 	// "out body" returns tags and geometry without the version/changeset/timestamp/user
 	// metadata that "out meta" includes. We don't use any of that metadata.
+	// "qt" (quadtile) sort avoids the default ID-based sort on the server, which the
+	// Overpass docs say has a cost. We don't depend on element ordering.
 	if _, err := sb.WriteString(`);
 (._;>;);
-out body;`); err != nil {
+out body qt;`); err != nil {
 		return "", fmt.Errorf(`writing query route component: %w`, err)
 	}
 	return sb.String(), nil
