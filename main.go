@@ -1044,7 +1044,7 @@ func queryResponseElements(
 			_ = resp.Body.Close()
 			return nil, &httpStatusError{statusCode: resp.StatusCode, status: resp.Status}
 		}
-		file, err := os.OpenFile(queryStateFilePath, os.O_RDWR|os.O_CREATE, 0666)
+		file, err := os.OpenFile(queryStateFilePath, os.O_RDWR|os.O_CREATE, 0600)
 		if err != nil {
 			_ = resp.Body.Close()
 			return nil, fmt.Errorf("opening query file for writing(%+v): %w", queryConditions, err)
