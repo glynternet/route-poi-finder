@@ -1150,7 +1150,11 @@ func resolveSymbol(tags map[string]interface{}) string {
 	} {
 		match := true
 		for k, matcherV := range symbolMatchers.tags {
-			v, ok := tags[k]
+			// Tags are map[string]interface{} from JSON decoding. Use a type
+			// assertion to string rather than comparing interface{} values
+			// directly, which would silently fail if the JSON decoder ever
+			// produced a non-string type for a tag value.
+			v, ok := tags[k].(string)
 			if !ok || v != matcherV {
 				match = false
 				break
