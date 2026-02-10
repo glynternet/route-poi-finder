@@ -28,8 +28,6 @@ import (
 )
 
 const (
-	dataDir = `/tmp/route-poi-finder-state`
-
 	debug = false
 )
 
@@ -472,6 +470,7 @@ func concurrentUnitsWorker[Unit any, Result any](
 // querying the Overpass API for nodes and way centres with retry support.
 func unitProcessor(
 	ctx context.Context,
+	dataDir string,
 	queryClient func(ctx context.Context, query string) (*http.Response, error),
 	queryElementsWithRetry func(ctx context.Context, queryFn func() ([]element, error)) ([]element, error),
 	queryWayCentresWithRetry func(ctx context.Context, queryFn func() ([]wayCentre, error)) ([]wayCentre, error),
@@ -491,7 +490,7 @@ func unitProcessor(
 		log.Printf("Worker processing split %d, query %d", unit.splitIndex+1, unit.queryIndex+1)
 
 		nodeElements, err := queryElementsWithRetry(ctx, func() ([]element, error) {
-			return nodes(ctx, queryClient, unit.query.conditions, aroundRoute)
+			return nodes(ctx, dataDir, queryClient, unit.query.conditions, aroundRoute)
 		})
 		if err != nil {
 			return workResult{}, fmt.Errorf("split %d query %d: getting nodes: %w",
@@ -499,7 +498,7 @@ func unitProcessor(
 		}
 
 		wayCentreElements, err := queryWayCentresWithRetry(ctx, func() ([]wayCentre, error) {
-			return wayCentres(ctx, queryClient, unit.query.conditions, aroundRoute)
+			return wayCentres(ctx, dataDir, queryClient, unit.query.conditions, aroundRoute)
 		})
 		if err != nil {
 			return workResult{}, fmt.Errorf("split %d query %d: getting way centres: %w",
@@ -528,6 +527,15 @@ func main() {
 	workers := flag.Int(`workers`, 0, `number of concurrent workers for API requests (0=auto-detect from API rate limit)`)
 	retries := flag.Int(`retries`, 5, `number of retries per API request on transient failures`)
 	failFast := flag.Bool(`fail-fast`, true, `stop processing on first API error`)
+
+	var defaultDataDir string
+	if homeDir, err := os.UserHomeDir(); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "Unable to determine home directory for default data directory: %v\n", err)
+		defaultDataDir = ".route-poi-finder-state"
+	} else {
+		defaultDataDir = filepath.Join(homeDir, `.route-poi-finder-state`)
+	}
+	dataDir := flag.String(`data-dir`, defaultDataDir, `directory to cache results in`)
 	flag.Parse()
 
 	if *workers < 0 {
@@ -544,14 +552,14 @@ func main() {
 		log.Println("must provide gpx file arg")
 		os.Exit(1)
 	}
-	if err := mainErr(args[0], *namePrefix, *split, *workers, *retries, *failFast, *out); err != nil {
+	if err := mainErr(args[0], *namePrefix, *split, *workers, *retries, *failFast, *dataDir, *out); err != nil {
 		log.Println(err.Error())
 		os.Exit(1)
 	}
 	os.Exit(0)
 }
 
-func mainErr(file string, namePrefix string, split uint, workers int, retries int, failFast bool, out string) error {
+func mainErr(file string, namePrefix string, split uint, workers int, retries int, failFast bool, dataDir string, out string) error {
 	if split == 0 {
 		return fmt.Errorf("--split must be greater than 0")
 	}
@@ -644,7 +652,7 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 		baseDelay:  5 * time.Second,
 		maxDelay:   60 * time.Second,
 	}
-	processUnits := concurrentUnitsWorker(workers, unitProcessor(ctx, client.Query, retrier[[]element](retryConf), retrier[[]wayCentre](retryConf)), failFast)
+	processUnits := concurrentUnitsWorker(workers, unitProcessor(ctx, dataDir, client.Query, retrier[[]element](retryConf), retrier[[]wayCentre](retryConf)), failFast)
 	results, err := processUnits(workUnits...)
 	if err != nil {
 		return err
@@ -891,11 +899,12 @@ out meta;`); err != nil {
 
 func nodes(
 	ctx context.Context,
+	dataDir string,
 	queryClient func(ctx context.Context, query string) (*http.Response, error),
 	conditions []condition,
 	route string,
 ) ([]element, error) {
-	responseElements, err := queryResponseElements(ctx, queryClient, `node`, conditions, route)
+	responseElements, err := queryResponseElements(ctx, dataDir, queryClient, `node`, conditions, route)
 	if err != nil {
 		return nil, fmt.Errorf("getting query response elements: %w", err)
 	}
@@ -911,11 +920,12 @@ func nodes(
 
 func wayCentres(
 	ctx context.Context,
+	dataDir string,
 	queryClient func(ctx context.Context, query string) (*http.Response, error),
 	conditions []condition,
 	route string,
 ) ([]wayCentre, error) {
-	responseElements, err := queryResponseElements(ctx, queryClient, `way`, conditions, route)
+	responseElements, err := queryResponseElements(ctx, dataDir, queryClient, `way`, conditions, route)
 	if err != nil {
 		return nil, fmt.Errorf("getting query response elements: %w", err)
 	}
@@ -959,6 +969,7 @@ func wayCentres(
 
 func queryResponseElements(
 	ctx context.Context,
+	dataDir string,
 	makeQueryRequest func(ctx context.Context, query string) (*http.Response, error),
 	queryType string,
 	queryConditions []condition,
