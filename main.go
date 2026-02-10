@@ -139,7 +139,7 @@ var queries = []query{{
 			"ridge",
 			"arete",
 			"hot spring",
-			"plateu",
+			"plateau",
 			"saddle",
 		},
 	}},
