@@ -125,6 +125,9 @@ func (c *Client) Query(ctx context.Context, query string) (*http.Response, error
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
+	// Overpass API usage policy expects clients to identify themselves.
+	// Requests without User-Agent may be deprioritised by the server.
+	req.Header.Set("User-Agent", "route-poi-finder")
 
 	return c.httpClient.Do(req)
 }
