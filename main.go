@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"maps"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -267,25 +268,26 @@ type response struct {
 }
 
 type element struct {
-	Type  string                 `json:"type"`
-	ID    int64                  `json:"id"`
-	Lat   float64                `json:"lat"`
-	Lon   float64                `json:"lon"`
-	Nodes []int64                `json:"nodes"`
-	Tags  map[string]interface{} `json:"tags"`
+	Type     string                 `json:"type"`
+	ID       int64                  `json:"id"`
+	Lat      float64                `json:"lat"`
+	Lon      float64                `json:"lon"`
+	Nodes    []int64                `json:"nodes"`
+	Tags     map[string]interface{} `json:"tags"`
+	Geometry []LatLon               `json:"geometry"`
 }
 
 // MODEL
 
 type LatLon struct {
-	Lat float64
-	Lon float64
+	Lat float64 `json:"lat"`
+	Lon float64 `json:"lon"`
 }
 
-type wayCentre struct {
-	ID     int64
-	Centre LatLon
-	Tags   map[string]interface{}
+type wayPoint struct {
+	ID   int64
+	Loc  LatLon
+	Tags map[string]interface{}
 }
 
 // Point is stolen from gpx project, should really import it instead
@@ -311,7 +313,7 @@ type workResult struct {
 	splitIndex int
 	queryIndex int
 	nodes      []element
-	wayCentres []wayCentre
+	wayPoints  []wayPoint
 }
 
 // retryConfig holds retry settings
@@ -474,7 +476,7 @@ func unitProcessor(
 	cacheTTL time.Duration,
 	queryClient func(ctx context.Context, query string) (*http.Response, error),
 	queryElementsWithRetry func(ctx context.Context, queryFn func() ([]element, error)) ([]element, error),
-	queryWayCentresWithRetry func(ctx context.Context, queryFn func() ([]wayCentre, error)) ([]wayCentre, error),
+	queryWayPointsWithRetry func(ctx context.Context, queryFn func() ([]wayPoint, error)) ([]wayPoint, error),
 ) func(unit workUnit) (workResult, error) {
 	return func(unit workUnit) (workResult, error) {
 		locus := 80
@@ -482,38 +484,38 @@ func unitProcessor(
 			locus = unit.query.radius
 		}
 
-		aroundRoute, err := queryRouteComponent(locus, unit.routePoints)
+		routeFilter, err := queryRouteFilter(locus, unit.routePoints)
 		if err != nil {
-			return workResult{}, fmt.Errorf("split %d query %d: creating query route component: %w",
+			return workResult{}, fmt.Errorf("split %d query %d: creating query route filter: %w",
 				unit.splitIndex+1, unit.queryIndex+1, err)
 		}
 
 		log.Printf("Worker processing split %d, query %d", unit.splitIndex+1, unit.queryIndex+1)
 
 		nodeElements, err := queryElementsWithRetry(ctx, func() ([]element, error) {
-			return nodes(ctx, cacheDir, cacheTTL, queryClient, unit.query.conditions, aroundRoute)
+			return nodes(ctx, cacheDir, cacheTTL, queryClient, unit.query.conditions, routeFilter)
 		})
 		if err != nil {
 			return workResult{}, fmt.Errorf("split %d query %d: getting nodes: %w",
 				unit.splitIndex+1, unit.queryIndex+1, err)
 		}
 
-		wayCentreElements, err := queryWayCentresWithRetry(ctx, func() ([]wayCentre, error) {
-			return wayCentres(ctx, cacheDir, cacheTTL, queryClient, unit.query.conditions, aroundRoute)
+		wayPointElements, err := queryWayPointsWithRetry(ctx, func() ([]wayPoint, error) {
+			return wayPoints(ctx, cacheDir, cacheTTL, queryClient, unit.query.conditions, routeFilter, unit.routePoints)
 		})
 		if err != nil {
-			return workResult{}, fmt.Errorf("split %d query %d: getting way centres: %w",
+			return workResult{}, fmt.Errorf("split %d query %d: getting way points: %w",
 				unit.splitIndex+1, unit.queryIndex+1, err)
 		}
 
-		log.Printf("Split %d, query %d: %d nodes, %d way centres",
-			unit.splitIndex+1, unit.queryIndex+1, len(nodeElements), len(wayCentreElements))
+		log.Printf("Split %d, query %d: %d nodes, %d way points",
+			unit.splitIndex+1, unit.queryIndex+1, len(nodeElements), len(wayPointElements))
 
 		return workResult{
 			splitIndex: unit.splitIndex,
 			queryIndex: unit.queryIndex,
 			nodes:      nodeElements,
-			wayCentres: wayCentreElements,
+			wayPoints:  wayPointElements,
 		}, nil
 	}
 }
@@ -559,6 +561,97 @@ func main() {
 		os.Exit(1)
 	}
 	os.Exit(0)
+}
+
+// segmentIntersection tests whether segments p1-p2 and p3-p4 intersect, and
+// if so returns the intersection point. It uses a standard parametric
+// approach: each segment is expressed as a linear combination
+//
+//	S1(t) = p1 + t*(p2-p1),  t ∈ [0,1]
+//	S2(u) = p3 + u*(p4-p3),  u ∈ [0,1]
+//
+// Setting S1(t) = S2(u) gives a 2×2 linear system solved via Cramer's rule.
+// If the denominator (the cross product of the direction vectors) is zero the
+// segments are parallel/collinear and we report no intersection. Otherwise
+// both parameters must lie in [0,1] for the intersection to fall within both
+// segments. Lat/lon are treated as Cartesian, which is adequate for the
+// sub-kilometre distances involved.
+func segmentIntersection(p1, p2, p3, p4 LatLon) (LatLon, bool) {
+	d1Lat := p2.Lat - p1.Lat
+	d1Lon := p2.Lon - p1.Lon
+	d2Lat := p4.Lat - p3.Lat
+	d2Lon := p4.Lon - p3.Lon
+
+	denom := d1Lat*d2Lon - d1Lon*d2Lat
+	if denom == 0 {
+		return LatLon{}, false // parallel or collinear
+	}
+
+	t := ((p3.Lat-p1.Lat)*d2Lon - (p3.Lon-p1.Lon)*d2Lat) / denom
+	u := ((p3.Lat-p1.Lat)*d1Lon - (p3.Lon-p1.Lon)*d1Lat) / denom
+
+	if t < 0 || t > 1 || u < 0 || u > 1 {
+		return LatLon{}, false
+	}
+
+	return LatLon{
+		Lat: p1.Lat + t*d1Lat,
+		Lon: p1.Lon + t*d1Lon,
+	}, true
+}
+
+// closestPointOnSegment returns the nearest point on segment a-b to point p,
+// along with the squared distance. It projects p onto the infinite line
+// through a-b by computing t = dot(p-a, b-a) / |b-a|². Clamping t to [0,1]
+// restricts the result to the segment. The projection point is then
+// a + t*(b-a) and the squared Euclidean distance to p is returned to avoid
+// an unnecessary sqrt.
+func closestPointOnSegment(a, b, p LatLon) (LatLon, float64) {
+	abLat := b.Lat - a.Lat
+	abLon := b.Lon - a.Lon
+	dot := (p.Lat-a.Lat)*abLat + (p.Lon-a.Lon)*abLon
+	lenSq := abLat*abLat + abLon*abLon
+
+	var t float64
+	if lenSq > 0 {
+		t = dot / lenSq
+		if t < 0 {
+			t = 0
+		} else if t > 1 {
+			t = 1
+		}
+	}
+
+	proj := LatLon{Lat: a.Lat + t*abLat, Lon: a.Lon + t*abLon}
+	dLat := proj.Lat - p.Lat
+	dLon := proj.Lon - p.Lon
+	return proj, dLat*dLat + dLon*dLon
+}
+
+// wayRouteIntersections finds all crossing points between a way's geometry and
+// the route, and also tracks the closest approach point. If crossings is
+// non-empty those should be used; otherwise closest is the fallback.
+func wayRouteIntersections(wayGeometry []LatLon, routePoints []gpxgo.GPXPoint) (crossings []LatLon, closest LatLon) {
+	bestDistSq := math.Inf(1)
+	for wi := 0; wi < len(wayGeometry)-1; wi++ {
+		w1 := wayGeometry[wi]
+		w2 := wayGeometry[wi+1]
+		for ri := 0; ri < len(routePoints)-1; ri++ {
+			r1 := LatLon{Lat: routePoints[ri].Latitude, Lon: routePoints[ri].Longitude}
+			r2 := LatLon{Lat: routePoints[ri+1].Latitude, Lon: routePoints[ri+1].Longitude}
+
+			if pt, ok := segmentIntersection(w1, w2, r1, r2); ok {
+				crossings = append(crossings, pt)
+			}
+
+			pt, distSq := closestPointOnSegment(w1, w2, r1)
+			if distSq < bestDistSq {
+				bestDistSq = distSq
+				closest = pt
+			}
+		}
+	}
+	return crossings, closest
 }
 
 func mainErr(file string, namePrefix string, split uint, workers int, retries int, failFast bool, cacheDir string, cacheTTL time.Duration, out string) error {
@@ -654,7 +747,7 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 		baseDelay:  5 * time.Second,
 		maxDelay:   60 * time.Second,
 	}
-	processUnits := concurrentUnitsWorker(workers, unitProcessor(ctx, cacheDir, cacheTTL, client.Query, retrier[[]element](retryConf), retrier[[]wayCentre](retryConf)), failFast)
+	processUnits := concurrentUnitsWorker(workers, unitProcessor(ctx, cacheDir, cacheTTL, client.Query, retrier[[]element](retryConf), retrier[[]wayPoint](retryConf)), failFast)
 	results, err := processUnits(workUnits...)
 	if err != nil {
 		return err
@@ -684,10 +777,10 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 			queryPointCounts.mark(humanFriendlyQueryConditions)
 		}
 
-		for _, wc := range result.wayCentres {
-			pt, err := getPoint(wc.Tags, wc.Centre)
+		for _, wp := range result.wayPoints {
+			pt, err := getPoint(wp.Tags, wp.Loc)
 			if err != nil {
-				return fmt.Errorf("getting point for way(%v): %w", wc, err)
+				return fmt.Errorf("getting point for wayPoint(%v): %w", wp, err)
 			}
 			pois[pt] = struct{}{}
 			queryPointCounts.mark(humanFriendlyQueryConditions)
@@ -860,45 +953,34 @@ func point(namePrefix string) (func(tags map[string]interface{}, latLon LatLon) 
 		}
 }
 
-func queryRouteComponent(locus int, route []gpxgo.GPXPoint) (string, error) {
-	if len(route) == 0 {
-		return "", fmt.Errorf(`no route points provided`)
-	}
-	var sb strings.Builder
-	if _, err := sb.WriteString(`(around:` + strconv.Itoa(locus) + `,`); err != nil {
-		return "", fmt.Errorf(`writing query route component: %w`, err)
-	}
-	if _, err := sb.WriteString(strconv.FormatFloat(route[0].Latitude, 'f', 6, 64)); err != nil {
-		return "", fmt.Errorf(`writing query route component: %w`, err)
-	}
-	if _, err := sb.WriteString(`,`); err != nil {
-		return "", fmt.Errorf(`writing query route component: %w`, err)
-	}
-	if _, err := sb.WriteString(strconv.FormatFloat(route[0].Longitude, 'f', 6, 64)); err != nil {
-		return "", fmt.Errorf(`writing query route component: %w`, err)
-	}
-	for _, p := range route[1:] {
-		if _, err := sb.WriteString(`,`); err != nil {
-			return "", fmt.Errorf(`writing query route component: %w`, err)
-		}
-		if _, err := sb.WriteString(strconv.FormatFloat(p.Latitude, 'f', 6, 64)); err != nil {
-			return "", fmt.Errorf(`writing query route component: %w`, err)
-		}
-		if _, err := sb.WriteString(`,`); err != nil {
-			return "", fmt.Errorf(`writing query route component: %w`, err)
-		}
-		if _, err := sb.WriteString(strconv.FormatFloat(p.Longitude, 'f', 6, 64)); err != nil {
-			return "", fmt.Errorf(`writing query route component: %w`, err)
-		}
-	}
+const (
+	// outputBodyRecurse resolves way members into their constituent nodes and
+	// returns tags/geometry. Used for node queries where we need full body data.
 	// "out body" returns tags and geometry without the version/changeset/timestamp/user
 	// metadata that "out meta" includes. We don't use any of that metadata.
 	// "qt" (quadtile) sort avoids the default ID-based sort on the server, which the
 	// Overpass docs say has a cost. We don't depend on element ordering.
-	if _, err := sb.WriteString(`);
-(._;>;);
-out body qt;`); err != nil {
-		return "", fmt.Errorf(`writing query route component: %w`, err)
+	outputBodyRecurse = ");\n(._;>;);\nout body qt;"
+
+	// outputGeom returns way geometry inline (no separate node elements needed).
+	// Used for way queries where we need the full way shape for crossing detection.
+	outputGeom = ");\nout geom qt;"
+)
+
+func queryRouteFilter(locus int, route []gpxgo.GPXPoint) (string, error) {
+	if len(route) == 0 {
+		return "", fmt.Errorf(`no route points provided`)
+	}
+	var sb strings.Builder
+	sb.WriteString(`(around:` + strconv.Itoa(locus) + `,`)
+	sb.WriteString(strconv.FormatFloat(route[0].Latitude, 'f', 6, 64))
+	sb.WriteString(`,`)
+	sb.WriteString(strconv.FormatFloat(route[0].Longitude, 'f', 6, 64))
+	for _, p := range route[1:] {
+		sb.WriteString(`,`)
+		sb.WriteString(strconv.FormatFloat(p.Latitude, 'f', 6, 64))
+		sb.WriteString(`,`)
+		sb.WriteString(strconv.FormatFloat(p.Longitude, 'f', 6, 64))
 	}
 	return sb.String(), nil
 }
@@ -909,9 +991,9 @@ func nodes(
 	cacheTTL time.Duration,
 	queryClient func(ctx context.Context, query string) (*http.Response, error),
 	conditions []condition,
-	route string,
+	routeFilter string,
 ) ([]element, error) {
-	responseElements, err := queryResponseElements(ctx, cacheDir, cacheTTL, queryClient, `node`, conditions, route)
+	responseElements, err := queryResponseElements(ctx, cacheDir, cacheTTL, queryClient, `node`, conditions, routeFilter, outputBodyRecurse)
 	if err != nil {
 		return nil, fmt.Errorf("getting query response elements: %w", err)
 	}
@@ -925,54 +1007,44 @@ func nodes(
 	return responseElements, nil
 }
 
-func wayCentres(
+func wayPoints(
 	ctx context.Context,
 	cacheDir string,
 	cacheTTL time.Duration,
 	queryClient func(ctx context.Context, query string) (*http.Response, error),
 	conditions []condition,
-	route string,
-) ([]wayCentre, error) {
-	responseElements, err := queryResponseElements(ctx, cacheDir, cacheTTL, queryClient, `way`, conditions, route)
+	routeFilter string,
+	routePoints []gpxgo.GPXPoint,
+) ([]wayPoint, error) {
+	responseElements, err := queryResponseElements(ctx, cacheDir, cacheTTL, queryClient, `way`, conditions, routeFilter, outputGeom)
 	if err != nil {
 		return nil, fmt.Errorf("getting query response elements: %w", err)
 	}
 
-	nodes := make(map[int64]element)
-	ways := make(map[int64]element)
+	var result []wayPoint
 	for _, e := range responseElements {
-		switch e.Type {
-		case `node`:
-			nodes[e.ID] = e
-		case `way`:
-			ways[e.ID] = e
-		default:
-			return nil, fmt.Errorf("unknown element type: %s: %v", e.Type, e)
+		if e.Type != `way` {
+			continue
 		}
-	}
-
-	wayCentres := make([]wayCentre, 0, len(ways))
-	for _, way := range ways {
-		if len(way.Nodes) == 0 {
-			return nil, fmt.Errorf("no nodes for way %d", way.ID)
-		}
-		var centre LatLon
-		for _, nodeID := range way.Nodes {
-			node, ok := nodes[nodeID]
-			if !ok {
-				return nil, fmt.Errorf("node %d not found", nodeID)
+		if len(e.Geometry) < 2 {
+			// Degenerate way: use the single geometry point if available
+			if len(e.Geometry) == 1 {
+				result = append(result, wayPoint{ID: e.ID, Loc: e.Geometry[0], Tags: e.Tags})
 			}
-			centre.Lat += node.Lat / float64(len(way.Nodes))
-			centre.Lon += node.Lon / float64(len(way.Nodes))
+			continue
 		}
-		wayCentres = append(wayCentres, wayCentre{
-			ID:     way.ID,
-			Centre: centre,
-			Tags:   way.Tags,
-		})
+
+		crossings, closest := wayRouteIntersections(e.Geometry, routePoints)
+		if len(crossings) > 0 {
+			for _, c := range crossings {
+				result = append(result, wayPoint{ID: e.ID, Loc: c, Tags: e.Tags})
+			}
+		} else {
+			result = append(result, wayPoint{ID: e.ID, Loc: closest, Tags: e.Tags})
+		}
 	}
 
-	return wayCentres, nil
+	return result, nil
 }
 
 func queryResponseElements(
@@ -982,7 +1054,8 @@ func queryResponseElements(
 	makeQueryRequest func(ctx context.Context, query string) (*http.Response, error),
 	queryType string,
 	queryConditions []condition,
-	route string,
+	routeFilter string,
+	outputSuffix string,
 ) ([]element, error) {
 	var sb strings.Builder
 	// timeout:120 tells the Overpass server to abort after 120s, matching our
@@ -1030,7 +1103,8 @@ func queryResponseElements(
 			}
 		}
 	}
-	sb.WriteString(route)
+	sb.WriteString(routeFilter)
+	sb.WriteString(outputSuffix)
 
 	renderedQuery := sb.String()
 
