@@ -1052,28 +1052,38 @@ func queryResponseElements(
 			_ = resp.Body.Close()
 			return nil, &httpStatusError{statusCode: resp.StatusCode, status: resp.Status}
 		}
-		file, err := os.OpenFile(queryStateFilePath, os.O_RDWR|os.O_CREATE, 0600)
+		tmpFile, err := os.CreateTemp(dataDir, ".tmp-*")
 		if err != nil {
 			_ = resp.Body.Close()
-			return nil, fmt.Errorf("opening query file for writing(%+v): %w", queryConditions, err)
+			return nil, fmt.Errorf("creating temp file for cache write(%+v): %w", queryConditions, err)
 		}
-		if _, err := io.Copy(file, resp.Body); err != nil {
+		if _, err := io.Copy(tmpFile, resp.Body); err != nil {
 			_ = resp.Body.Close()
-			_ = file.Close()
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpFile.Name())
 			return nil, fmt.Errorf("outputting response body: %w", err)
 		}
-		if debug {
-			log.Printf("query result written: %s", file.Name())
-		}
 		if err := resp.Body.Close(); err != nil {
-			_ = file.Close()
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpFile.Name())
 			return nil, fmt.Errorf("closing response body: %w", err)
 		}
-		if _, err := file.Seek(0, io.SeekStart); err != nil {
-			_ = file.Close()
-			return nil, fmt.Errorf("seeking to start of query response state file: %w", err)
+		if err := tmpFile.Close(); err != nil {
+			_ = os.Remove(tmpFile.Name())
+			return nil, fmt.Errorf("closing temp file: %w", err)
 		}
-		rc = file
+		if err := os.Rename(tmpFile.Name(), queryStateFilePath); err != nil {
+			_ = os.Remove(tmpFile.Name())
+			return nil, fmt.Errorf("renaming temp file to cache path: %w", err)
+		}
+		if debug {
+			log.Printf("query result written: %s", queryStateFilePath)
+		}
+		stored, err := os.Open(queryStateFilePath)
+		if err != nil {
+			return nil, fmt.Errorf("opening cached result after write: %w", err)
+		}
+		rc = stored
 	} else if err != nil {
 		return nil, fmt.Errorf("opening query state file(%s): %w", queryStateFilePath, err)
 	}

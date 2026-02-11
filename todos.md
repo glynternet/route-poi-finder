@@ -1,48 +1,12 @@
 # Overpass API Usage: Audit Findings & TODOs
 
-## Fix typo: `"plateu"` should be `"plateau"`
-
-**File:** `main.go:142`
-**Type:** Bug
-**Effort:** Trivial
-
-The value `"plateu"` in the `natural` tag query will never match any OSM data. The correct tag value is `natural=plateau`.
-
-**Current code:**
-```go
-values: []string{
-    "spring", "peak", "mountain_range", "ridge",
-    "arete", "hot spring", "plateu", "saddle",
-},
-```
-
-**References:**
-- OSM wiki for `natural=plateau`: https://wiki.openstreetmap.org/wiki/Tag:natural%3Dplateau
-- OSM Taginfo for `natural=plateau`: https://taginfo.openstreetmap.org/tags/natural=plateau
-
----
-
-## Fix tag value: `"hot spring"` should be `"hot_spring"`
-
-**File:** `main.go:141`
-**Type:** Bug
-**Effort:** Trivial
-
-OSM tag values use underscores, not spaces. The value `"hot spring"` is rendered into a regex filter as `natural~"^(...|hot spring|...)$"` which will never match because the actual OSM tag is `natural=hot_spring`. All hot springs are silently dropped from results.
-
-**References:**
-- OSM wiki for `natural=hot_spring`: https://wiki.openstreetmap.org/wiki/Tag:natural%3Dhot_spring
-- OSM Taginfo for `natural=hot_spring`: https://taginfo.openstreetmap.org/tags/natural=hot_spring
-
----
-
-## Use `out center` instead of `(._;>;); out meta;` for way queries
+## Use `out center` instead of `(._;>;); out body qt;` for way queries
 
 **File:** `main.go:892-894` (query suffix), `main.go:921-967` (`wayCentres` function)
 **Type:** Efficiency
 **Effort:** Medium
 
-The current approach for way queries uses the recurse-down pattern `(._;>;); out meta;`, which fetches the matched ways *and every constituent node* of those ways. The `wayCentres()` function then manually computes a centroid by averaging node coordinates. This is expensive in terms of data transfer and server processing.
+The current approach for way queries uses the recurse-down pattern `(._;>;); out body qt;`, which fetches the matched ways *and every constituent node* of those ways. The `wayCentres()` function then manually computes a centroid by averaging node coordinates. This is expensive in terms of data transfer and server processing.
 
 The Overpass API provides `out center` specifically for this use case. It returns ways with a single representative coordinate (the center of the way's bounding box) without needing to recurse into constituent nodes. This is the standard approach for POI-style queries and is what tools like Overpass Turbo use.
 
@@ -89,38 +53,6 @@ With `out center`, both nodes (which return their own lat/lon) and ways (which r
 
 ---
 
-## Add `User-Agent` header to API requests
-
-**File:** `overpass/client.go:124-129`
-**Type:** Policy compliance
-**Effort:** Trivial
-
-The HTTP POST requests to the Overpass API are sent without a `User-Agent` header. The Overpass API usage policy expects clients to identify themselves. Requests without identification may be deprioritised or, in extreme cases, blocked. Adding a header like `User-Agent: route-poi-finder/1.0` is a one-line fix.
-
-**References:**
-- Overpass API usage policy: https://wiki.openstreetmap.org/wiki/Overpass_API#Usage_Policy
-- Overpass API rate limiting and fair use: https://dev.overpass-api.de/overpass-doc/en/preface/commons.html
-
----
-
-## Align client HTTP timeout with Overpass server query timeout
-
-**File:** `overpass/client.go:41` (HTTP timeout), `main.go:979` (query header)
-**Type:** Correctness
-**Effort:** Trivial
-
-The HTTP client timeout is set to 120 seconds, but the Overpass API's default server-side query timeout is 180 seconds. This means a query can still be running on the server (consuming a rate-limit slot) after the client has timed out and moved on. The client may then retry, starting a *second* query while the first is still running, potentially consuming two slots.
-
-Fix by either:
-- Adding `[timeout:120]` to the query preamble (`[out:json][timeout:120];`) so the server aborts at the same time the client does, or
-- Increasing the HTTP client timeout to 180 seconds to match the server default
-
-**References:**
-- Overpass QL timeout setting: https://wiki.openstreetmap.org/wiki/Overpass_API/Overpass_QL#timeout
-- Overpass documentation on settings: https://dev.overpass-api.de/overpass-doc/en/preface/commons.html
-
----
-
 ## Downsample route points in `around` filter
 
 **File:** `main.go:861-897` (`queryRouteComponent`)
@@ -142,74 +74,6 @@ The Overpass docs note that the `around` filter performs spherical distance calc
 
 ---
 
-## Add `qt` (quadtile) sort to query output
-
-**File:** `main.go:892-894` (query suffix)
-**Type:** Efficiency
-**Effort:** Trivial
-
-The Overpass API's default output sorting is by OSM element ID, which requires a sort step on the server. The `qt` modifier sorts by quadtile index instead, which the documentation states "eliminates the effort to sort the output" since data is already stored in spatial order. Since this tool collects POIs and does not depend on ID ordering, using `out center qt;` (or `out body qt;` for node queries) would reduce server-side processing time at no cost.
-
-**References:**
-- Overpass QL output sort order: https://wiki.openstreetmap.org/wiki/Overpass_API/Overpass_QL#Output_Sort_Order
-- Overpass Language Guide on output: https://wiki.openstreetmap.org/wiki/Overpass_API/Language_Guide#Output
-
----
-
-## Use `out body` instead of `out meta`
-
-**File:** `main.go:894`
-**Type:** Efficiency
-**Effort:** Trivial
-
-`out meta` includes version number, changeset ID, timestamp, and username for each element. None of this metadata is used anywhere in the codebase. `out body` (or equivalently just `out`) returns tags and geometry, which is everything the tool needs, with less data transferred.
-
-Combined with the `qt` and `center` suggestions, the ideal output statement for way queries would be `out center qt;` and for node queries `out body qt;` (or unified as `out center qt;` if using a union query).
-
-**References:**
-- Overpass QL output format: https://wiki.openstreetmap.org/wiki/Overpass_API/Overpass_QL#Output_Format_(out)
-- Overpass documentation on output verbosity: https://dev.overpass-api.de/overpass-doc/en/full_data/osm_types.html
-
----
-
-## Fix cache file permissions from `0666` to `0600`
-
-**File:** `main.go:1047`
-**Type:** Security
-**Effort:** Trivial
-
-Cache files are created with permissions `0666` (read/write for all users). On multi-user systems, any user can read, modify, or corrupt the cache. This could lead to tampered results or information disclosure (the cache reveals what routes have been queried). Use `0600` (read/write for owner only) or `0644` (owner write, world read).
-
-**Current code:**
-```go
-file, err := os.OpenFile(queryStateFilePath, os.O_RDWR|os.O_CREATE, 0666)
-```
-
----
-
-## Make cache writes atomic
-
-**File:** `main.go:1047-1068`
-**Type:** Robustness
-**Effort:** Small
-
-If the process is killed or crashes during `io.Copy` (`main.go:1052`), the cache file will contain a partial JSON response. On the next run, the cache lookup finds this file, attempts to parse it, and fails with a JSON decode error. The user must then manually identify and delete the corrupted file from the cache directory.
-
-The standard fix is to write to a temporary file in the same directory and then `os.Rename` it into place. `Rename` is atomic on POSIX filesystems, so the cache file is either the complete old version or the complete new version, never a partial write.
-
-```go
-tmpFile, err := os.CreateTemp(dataDir, ".tmp-*")
-// ... io.Copy to tmpFile ...
-// ... tmpFile.Close() ...
-os.Rename(tmpFile.Name(), queryStateFilePath)
-```
-
-**References:**
-- POSIX rename atomicity guarantee: https://pubs.opengroup.org/onlinepubs/9699919799/functions/rename.html
-- Go os.Rename documentation: https://pkg.go.dev/os#Rename
-
----
-
 ## Add cache TTL or invalidation mechanism
 
 **File:** `main.go:1032-1036`
@@ -218,7 +82,7 @@ os.Rename(tmpFile.Name(), queryStateFilePath)
 
 Cached API responses persist indefinitely with no expiration. OSM data is continuously updated by contributors: new POIs are added, old ones are removed, tags are corrected. A query cached months ago may return stale data (e.g. a closed restaurant still appearing, a new water source missing).
 
-Consider checking file modification time and re-querying if the cache entry is older than a configurable threshold (e.g. `--cache-max-age 7d`, defaulting to something reasonable like 30 days). Alternatively, a `--no-cache` flag to bypass the cache entirely would help during iterative use.
+If a cached item is over 28 days old, it should be replaced. Check file modification time and re-query if the cache entry exceeds this threshold. A `--no-cache` flag to bypass the cache entirely would also help during iterative use.
 
 **References:**
 - Go os.FileInfo ModTime: https://pkg.go.dev/os#FileInfo
@@ -299,34 +163,6 @@ Querying relations is generally discouraged by the Overpass documentation due to
 
 ---
 
-## Status endpoint requests also lack `User-Agent`
-
-**File:** `overpass/status.go:24-27`
-**Type:** Policy compliance
-**Effort:** Trivial
-
-The `StatusFetcher` creates its own `http.Client` for GET requests to `/api/status`, separate from the client used for interpreter queries. This client also sends no `User-Agent` header. Since the Overpass API identifies users by IP address, the status endpoint and query endpoint are counted together for rate-limiting purposes. Both should identify the application.
-
-**References:**
-- Overpass API usage policy: https://wiki.openstreetmap.org/wiki/Overpass_API#Usage_Policy
-- Overpass documentation on user identification: https://dev.overpass-api.de/overpass-doc/en/preface/commons.html
-
----
-
-## No `Content-Type` header on POST requests
-
-**File:** `overpass/client.go:124`
-**Type:** Correctness
-**Effort:** Trivial
-
-The POST request to the interpreter endpoint does not set a `Content-Type` header. The Overpass API accepts `application/x-www-form-urlencoded` (with a `data=` prefix) or raw query text. Go's `http.NewRequestWithContext` with a `strings.NewReader` body does not set `Content-Type` automatically, so the server must infer the format. This works today but is technically ambiguous. Setting `Content-Type: application/x-www-form-urlencoded` (and prefixing the body with `data=`) or documenting reliance on the server's default behaviour would be more robust.
-
-**References:**
-- Overpass API wiki on query methods: https://wiki.openstreetmap.org/wiki/Overpass_API#Introduction
-- Go net/http documentation on request body: https://pkg.go.dev/net/http#NewRequestWithContext
-
----
-
 ## Status fetch failure drops pending requests without retry
 
 **File:** `overpass/client.go:202-209`
@@ -378,22 +214,6 @@ For routes in non-English-speaking regions, the `name` tag is often in the local
 
 ---
 
-## `resolveSymbol` compares `interface{}` values directly
-
-**File:** `main.go:1144-1146`
-**Type:** Fragility
-**Effort:** Trivial
-
-The `resolveSymbol` function compares OSM tag values (typed as `map[string]interface{}`) directly against string literals using `v != matcherV`. This works in Go because the JSON decoder produces `string` as the dynamic type for JSON string values, and Go's `==` on interfaces compares both dynamic type and value. However, this relies on the JSON decoder's behaviour and would silently break if a tag value were decoded as a different type (e.g. a numeric-looking value decoded as `float64`).
-
-An explicit type assertion (`v, ok := tags[k].(string)`) before comparison, as `resolveName` already does on line 1097, would be more defensive.
-
-**References:**
-- Go spec on interface comparison: https://go.dev/ref/spec#Comparison_operators
-- Go encoding/json decoder types: https://pkg.go.dev/encoding/json#Unmarshal
-
----
-
 ## Waterway query excludes `stream` which may be useful
 
 **File:** `main.go:185-195`
@@ -439,6 +259,8 @@ This is inherent to reducing areas to points. For the tool's purpose of finding 
 If two workers happen to process the same query hash concurrently (unlikely with the current split-based design, but possible if two categories produce identical rendered queries), both will miss the cache, both will query the API, and both will write to the same file path. The second write will overwrite the first, which is benign for correctness (both contain the same data), but the concurrent `io.Copy` calls could interleave and produce a corrupted file.
 
 This is largely a theoretical concern given the current architecture (each work unit has a unique combination of query type, conditions, and route segment). However, if the tool evolves to support overlapping segments or shared query patterns, this could become a real issue. Using atomic writes (as suggested in the "Make cache writes atomic" section) with unique temp files would also solve this.
+
+It would be great to intoduce a single-flight mechanism, so that if two workers try to request the same data, only the first worker to request it makes a request, and the second (or more) just waits for the result of the first query through some data joining mechanism. This may make the effort greater than "Small".
 
 **References:**
 - Go os.CreateTemp for unique temp files: https://pkg.go.dev/os#CreateTemp
