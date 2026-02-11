@@ -143,6 +143,7 @@ func (c *Client) coordinator(ctx context.Context) {
 	timerFired := make(chan struct{}, 1)
 	var timerActive bool
 	var nextSlotWait time.Duration
+	var statusRetries int
 
 	for {
 		select {
@@ -171,8 +172,8 @@ func (c *Client) coordinator(ctx context.Context) {
 
 				// If no timer running, fetch status now
 				if !timerActive {
-					pendingRequests, timerActive, nextSlotWait = c.fetchStatusAndSchedule(
-						ctx, pendingRequests, timerFired)
+					pendingRequests, timerActive, nextSlotWait, statusRetries = c.fetchStatusAndSchedule(
+						ctx, pendingRequests, timerFired, statusRetries)
 				}
 			}
 
@@ -180,8 +181,8 @@ func (c *Client) coordinator(ctx context.Context) {
 			timerActive = false
 			// Timer fired - fetch fresh status and process
 			if len(pendingRequests) > 0 {
-				pendingRequests, timerActive, nextSlotWait = c.fetchStatusAndSchedule(
-					ctx, pendingRequests, timerFired)
+				pendingRequests, timerActive, nextSlotWait, statusRetries = c.fetchStatusAndSchedule(
+					ctx, pendingRequests, timerFired, statusRetries)
 			}
 
 		case <-ctx.Done():
@@ -201,21 +202,41 @@ func (c *Client) coordinator(ctx context.Context) {
 	}
 }
 
-// fetchStatusAndSchedule fetches status, serves what it can, and schedules one timer if needed
+// fetchStatusAndSchedule fetches status, serves what it can, and schedules one timer if needed.
+// statusRetries tracks consecutive status fetch failures for exponential backoff.
 func (c *Client) fetchStatusAndSchedule(
 	ctx context.Context,
 	pendingRequests []slotRequest,
 	timerFired chan<- struct{},
-) (remaining []slotRequest, timerActive bool, nextWait time.Duration) {
+	statusRetries int,
+) (remaining []slotRequest, timerActive bool, nextWait time.Duration, retries int) {
+	const maxStatusRetries = 3
 	status, err := c.fetchStatus()
 	if err != nil {
-		// Fail the oldest pending request
+		if statusRetries < maxStatusRetries {
+			statusRetries++
+			backoff := time.Duration(5<<(statusRetries-1)) * time.Second // 5s, 10s, 20s
+			log.Printf("Status fetch failed (attempt %d/%d), retrying in %s: %v",
+				statusRetries, maxStatusRetries, backoff, err)
+			time.AfterFunc(backoff, func() {
+				select {
+				case timerFired <- struct{}{}:
+				default:
+				}
+			})
+			return pendingRequests, true, backoff, statusRetries
+		}
+		// Max retries exhausted, fail the oldest pending request
+		log.Printf("Status fetch failed after %d retries, failing oldest request: %v",
+			maxStatusRetries, err)
 		if len(pendingRequests) > 0 {
-			pendingRequests[0].result <- fmt.Errorf("fetching API status: %w", err)
+			pendingRequests[0].result <- fmt.Errorf("fetching API status after %d retries: %w", maxStatusRetries, err)
 			pendingRequests = pendingRequests[1:]
 		}
-		return pendingRequests, false, 0
+		return pendingRequests, false, 0, 0
 	}
+	// Reset retry counter on success
+	statusRetries = 0
 
 	// Edge case: no slots and no wait times
 	if status.AvailableNow == 0 && len(status.NextSlotWaits) == 0 {
@@ -223,7 +244,7 @@ func (c *Client) fetchStatusAndSchedule(
 			pendingRequests[0].result <- errors.New("no slots available and no wait times provided")
 			pendingRequests = pendingRequests[1:]
 		}
-		return pendingRequests, false, 0
+		return pendingRequests, false, 0, statusRetries
 	}
 
 	if len(status.NextSlotWaits) > 0 {
@@ -264,10 +285,10 @@ drained:
 			default:
 			}
 		})
-		return pendingRequests, true, nextWait
+		return pendingRequests, true, nextWait, statusRetries
 	}
 
-	return pendingRequests, false, 0
+	return pendingRequests, false, 0, statusRetries
 }
 
 // servePendingRequests attempts to serve pending requests with available tokens

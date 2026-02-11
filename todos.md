@@ -147,22 +147,6 @@ Querying relations is generally discouraged by the Overpass documentation due to
 
 ---
 
-## Status fetch failure drops pending requests without retry
-
-**File:** `overpass/client.go:202-209`
-**Type:** Robustness
-**Effort:** Small
-
-When `fetchStatusAndSchedule` fails to fetch the `/api/status` endpoint (network error, temporary server issue), it fails the **oldest pending request** and returns with no timer scheduled. Any remaining pending requests sit in the queue indefinitely until a new incoming request triggers another status fetch attempt. There is no retry with backoff for the status fetch itself.
-
-If the status endpoint is temporarily unreachable (e.g. brief network blip), this causes one request to fail unnecessarily and leaves remaining queued requests stranded until new activity arrives. A retry with a short backoff (e.g. 5s, 10s, 20s) before failing requests would be more resilient.
-
-**References:**
-- Overpass API status endpoint: https://wiki.openstreetmap.org/wiki/Overpass_API#Status
-- Go time.AfterFunc for scheduling retries: https://pkg.go.dev/time#AfterFunc
-
----
-
 ## Slots are not returned after query completion
 
 **File:** `overpass/client.go:100-130`
