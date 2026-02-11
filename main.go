@@ -1138,10 +1138,29 @@ func resolveName(tags map[string]interface{}) (string, error) {
 		"man_made",
 		"drinking_water",
 	} {
-		n, ok := tags[tag].(string)
+		n, ok := tags[tag]
 		if ok {
+			n, ok := n.(string)
+			if !ok {
+				return "", fmt.Errorf("tag '%s' is not a string", tag)
+			}
 			return n, nil
 		}
+	}
+	var yesTags []string
+	for tag, v := range tags {
+		v, ok := v.(string)
+		if !ok {
+			return "", fmt.Errorf("tag '%s' is not a string", tag)
+		}
+		if v == "yes" {
+			yesTags = append(yesTags, tag)
+		}
+	}
+	if len(yesTags) > 0 {
+		slices.Sort(yesTags)
+		log.Printf(`Resolved name from tags with value "yes": %s`, yesTags)
+		return strings.Join(yesTags, " "), nil
 	}
 	return "", errors.New("no suitable tag for name")
 }
