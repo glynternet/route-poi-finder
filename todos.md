@@ -165,23 +165,6 @@ An alternative design would return tokens after a conservative cooldown estimate
 
 ---
 
-## Name resolution ignores localised and alternative name tags
-
-**File:** `main.go:1084-1103` (`resolveName`)
-**Type:** Data quality
-**Effort:** Small
-
-`resolveName` checks a fixed list of 10 tag keys (`name`, `amenity`, `tourism`, etc.) in priority order. It does not consider localised name tags (`name:en`, `name:de`, `name:fr`, etc.), alternative names (`alt_name`), international names (`int_name`), or official names (`official_name`).
-
-For routes in non-English-speaking regions, the `name` tag is often in the local script (e.g. Cyrillic, CJK, Arabic). If the user would benefit from English names, checking `name:en` before or after `name` would improve readability. Similarly, `alt_name` can provide useful context when `name` is missing or unhelpful.
-
-**References:**
-- OSM wiki on multilingual names: https://wiki.openstreetmap.org/wiki/Multilingual_names
-- OSM wiki on name key: https://wiki.openstreetmap.org/wiki/Key:name
-- OSM wiki on `alt_name`: https://wiki.openstreetmap.org/wiki/Key:alt_name
-
----
-
 ## Waterway query excludes `stream` which may be useful
 
 **File:** `main.go:185-195`

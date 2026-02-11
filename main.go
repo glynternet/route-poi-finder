@@ -1124,6 +1124,10 @@ func atomicSlurp(cacheDir string, resp io.Reader, path string) ([]element, error
 func resolveName(tags map[string]interface{}) (string, error) {
 	for _, tag := range []string{
 		"name",
+		"name:en",
+		"int_name",
+		"official_name",
+		"alt_name",
 		"amenity",
 		"tourism",
 		"leisure",
