@@ -470,7 +470,8 @@ func concurrentUnitsWorker[Unit any, Result any](
 // querying the Overpass API for nodes and way centres with retry support.
 func unitProcessor(
 	ctx context.Context,
-	dataDir string,
+	cacheDir string,
+	cacheTTL time.Duration,
 	queryClient func(ctx context.Context, query string) (*http.Response, error),
 	queryElementsWithRetry func(ctx context.Context, queryFn func() ([]element, error)) ([]element, error),
 	queryWayCentresWithRetry func(ctx context.Context, queryFn func() ([]wayCentre, error)) ([]wayCentre, error),
@@ -490,7 +491,7 @@ func unitProcessor(
 		log.Printf("Worker processing split %d, query %d", unit.splitIndex+1, unit.queryIndex+1)
 
 		nodeElements, err := queryElementsWithRetry(ctx, func() ([]element, error) {
-			return nodes(ctx, dataDir, queryClient, unit.query.conditions, aroundRoute)
+			return nodes(ctx, cacheDir, cacheTTL, queryClient, unit.query.conditions, aroundRoute)
 		})
 		if err != nil {
 			return workResult{}, fmt.Errorf("split %d query %d: getting nodes: %w",
@@ -498,7 +499,7 @@ func unitProcessor(
 		}
 
 		wayCentreElements, err := queryWayCentresWithRetry(ctx, func() ([]wayCentre, error) {
-			return wayCentres(ctx, dataDir, queryClient, unit.query.conditions, aroundRoute)
+			return wayCentres(ctx, cacheDir, cacheTTL, queryClient, unit.query.conditions, aroundRoute)
 		})
 		if err != nil {
 			return workResult{}, fmt.Errorf("split %d query %d: getting way centres: %w",
@@ -528,14 +529,15 @@ func main() {
 	retries := flag.Int(`retries`, 5, `number of retries per API request on transient failures`)
 	failFast := flag.Bool(`fail-fast`, true, `stop processing on first API error`)
 
-	var defaultDataDir string
+	var defaultCacheDir string
 	if homeDir, err := os.UserHomeDir(); err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "Unable to determine home directory for default data directory: %v\n", err)
-		defaultDataDir = ".route-poi-finder-state"
+		_, _ = fmt.Fprintf(os.Stderr, "Unable to determine home directory for default cache directory: %v\n", err)
+		defaultCacheDir = ".route-poi-finder-state"
 	} else {
-		defaultDataDir = filepath.Join(homeDir, `.route-poi-finder-state`)
+		defaultCacheDir = filepath.Join(homeDir, `.route-poi-finder-state`)
 	}
-	dataDir := flag.String(`data-dir`, defaultDataDir, `directory to cache results in`)
+	cacheDir := flag.String(`cache-dir`, defaultCacheDir, `directory to cache results in`)
+	cacheTTL := flag.Duration(`cache-ttl`, 28*24*time.Hour, `maximum age of cached API responses before re-querying`)
 	flag.Parse()
 
 	if *workers < 0 {
@@ -552,14 +554,14 @@ func main() {
 		log.Println("must provide gpx file arg")
 		os.Exit(1)
 	}
-	if err := mainErr(args[0], *namePrefix, *split, *workers, *retries, *failFast, *dataDir, *out); err != nil {
+	if err := mainErr(args[0], *namePrefix, *split, *workers, *retries, *failFast, *cacheDir, *cacheTTL, *out); err != nil {
 		log.Println(err.Error())
 		os.Exit(1)
 	}
 	os.Exit(0)
 }
 
-func mainErr(file string, namePrefix string, split uint, workers int, retries int, failFast bool, dataDir string, out string) error {
+func mainErr(file string, namePrefix string, split uint, workers int, retries int, failFast bool, cacheDir string, cacheTTL time.Duration, out string) error {
 	if split == 0 {
 		return fmt.Errorf("--split must be greater than 0")
 	}
@@ -601,18 +603,18 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 		return fmt.Errorf("expected gpx track to contain exactly one segment but found %d", len(gpx.Tracks[0].Segments))
 	}
 
-	stat, err := os.Stat(dataDir)
+	stat, err := os.Stat(cacheDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			if err := os.MkdirAll(dataDir, 0755); err != nil {
-				return fmt.Errorf("creating data dir at %s: %w", dataDir, err)
+			if err := os.MkdirAll(cacheDir, 0755); err != nil {
+				return fmt.Errorf("creating cache dir at %s: %w", cacheDir, err)
 			}
-			log.Printf("created data dir at %s", dataDir)
+			log.Printf("created cache dir at %s", cacheDir)
 		} else {
-			return fmt.Errorf("checking data dir at %s: %w", dataDir, err)
+			return fmt.Errorf("checking cache dir at %s: %w", cacheDir, err)
 		}
 	} else if !stat.IsDir() {
-		return fmt.Errorf("data dir at %s is not a directory", dataDir)
+		return fmt.Errorf("cache dir at %s is not a directory", cacheDir)
 	}
 
 	pts := gpx.Tracks[0].Segments[0].Points
@@ -652,7 +654,7 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 		baseDelay:  5 * time.Second,
 		maxDelay:   60 * time.Second,
 	}
-	processUnits := concurrentUnitsWorker(workers, unitProcessor(ctx, dataDir, client.Query, retrier[[]element](retryConf), retrier[[]wayCentre](retryConf)), failFast)
+	processUnits := concurrentUnitsWorker(workers, unitProcessor(ctx, cacheDir, cacheTTL, client.Query, retrier[[]element](retryConf), retrier[[]wayCentre](retryConf)), failFast)
 	results, err := processUnits(workUnits...)
 	if err != nil {
 		return err
@@ -903,12 +905,13 @@ out body qt;`); err != nil {
 
 func nodes(
 	ctx context.Context,
-	dataDir string,
+	cacheDir string,
+	cacheTTL time.Duration,
 	queryClient func(ctx context.Context, query string) (*http.Response, error),
 	conditions []condition,
 	route string,
 ) ([]element, error) {
-	responseElements, err := queryResponseElements(ctx, dataDir, queryClient, `node`, conditions, route)
+	responseElements, err := queryResponseElements(ctx, cacheDir, cacheTTL, queryClient, `node`, conditions, route)
 	if err != nil {
 		return nil, fmt.Errorf("getting query response elements: %w", err)
 	}
@@ -924,12 +927,13 @@ func nodes(
 
 func wayCentres(
 	ctx context.Context,
-	dataDir string,
+	cacheDir string,
+	cacheTTL time.Duration,
 	queryClient func(ctx context.Context, query string) (*http.Response, error),
 	conditions []condition,
 	route string,
 ) ([]wayCentre, error) {
-	responseElements, err := queryResponseElements(ctx, dataDir, queryClient, `way`, conditions, route)
+	responseElements, err := queryResponseElements(ctx, cacheDir, cacheTTL, queryClient, `way`, conditions, route)
 	if err != nil {
 		return nil, fmt.Errorf("getting query response elements: %w", err)
 	}
@@ -973,7 +977,8 @@ func wayCentres(
 
 func queryResponseElements(
 	ctx context.Context,
-	dataDir string,
+	cacheDir string,
+	cacheTTL time.Duration,
 	makeQueryRequest func(ctx context.Context, query string) (*http.Response, error),
 	queryType string,
 	queryConditions []condition,
@@ -1036,13 +1041,26 @@ func queryResponseElements(
 	sha := base64.URLEncoding.EncodeToString(hasher.Sum(nil))
 
 	var rc io.ReadCloser
-	queryStateFilePath := filepath.Join(dataDir, sha)
-	if stored, err := os.Open(queryStateFilePath); err == nil {
-		if debug {
-			log.Printf("query fetched from cached result: %s", queryStateFilePath)
+	queryStateFilePath := filepath.Join(cacheDir, sha)
+	if info, err := os.Stat(queryStateFilePath); err == nil {
+		if time.Since(info.ModTime()) > cacheTTL {
+			log.Printf("cache expired (age %s > ttl %s): %s:%+v",
+				time.Since(info.ModTime()).Round(time.Second), cacheTTL, queryType, queryConditions)
+		} else {
+			stored, err := os.Open(queryStateFilePath)
+			if err != nil {
+				return nil, fmt.Errorf("opening cached query state file(%s): %w", queryStateFilePath, err)
+			}
+			if debug {
+				log.Printf("query fetched from cached result: %s", queryStateFilePath)
+			}
+			rc = stored
 		}
-		rc = stored
-	} else if os.IsNotExist(err) {
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("checking cache file(%s): %w", queryStateFilePath, err)
+	}
+
+	if rc == nil {
 		log.Printf("query result not cached, making query to API: %s:%+v", queryType, queryConditions)
 		resp, err := makeQueryRequest(ctx, renderedQuery)
 		if err != nil {
@@ -1052,30 +1070,15 @@ func queryResponseElements(
 			_ = resp.Body.Close()
 			return nil, &httpStatusError{statusCode: resp.StatusCode, status: resp.Status}
 		}
-		tmpFile, err := os.CreateTemp(dataDir, ".tmp-*")
+		elements, err := atomicSlurp(cacheDir, resp.Body, queryStateFilePath)
 		if err != nil {
 			_ = resp.Body.Close()
-			return nil, fmt.Errorf("creating temp file for cache write(%+v): %w", queryConditions, err)
-		}
-		if _, err := io.Copy(tmpFile, resp.Body); err != nil {
-			_ = resp.Body.Close()
-			_ = tmpFile.Close()
-			_ = os.Remove(tmpFile.Name())
-			return nil, fmt.Errorf("outputting response body: %w", err)
+			return elements, fmt.Errorf("storing content into cache: (%q): %w", queryConditions, err)
 		}
 		if err := resp.Body.Close(); err != nil {
-			_ = tmpFile.Close()
-			_ = os.Remove(tmpFile.Name())
 			return nil, fmt.Errorf("closing response body: %w", err)
 		}
-		if err := tmpFile.Close(); err != nil {
-			_ = os.Remove(tmpFile.Name())
-			return nil, fmt.Errorf("closing temp file: %w", err)
-		}
-		if err := os.Rename(tmpFile.Name(), queryStateFilePath); err != nil {
-			_ = os.Remove(tmpFile.Name())
-			return nil, fmt.Errorf("renaming temp file to cache path: %w", err)
-		}
+
 		if debug {
 			log.Printf("query result written: %s", queryStateFilePath)
 		}
@@ -1084,8 +1087,6 @@ func queryResponseElements(
 			return nil, fmt.Errorf("opening cached result after write: %w", err)
 		}
 		rc = stored
-	} else if err != nil {
-		return nil, fmt.Errorf("opening query state file(%s): %w", queryStateFilePath, err)
 	}
 
 	var r response
@@ -1097,6 +1098,27 @@ func queryResponseElements(
 		return nil, fmt.Errorf("closing response body: %w", err)
 	}
 	return r.Elements, nil
+}
+
+func atomicSlurp(cacheDir string, resp io.Reader, path string) ([]element, error) {
+	tmpFile, err := os.CreateTemp(cacheDir, ".tmp-*")
+	if err != nil {
+		return nil, fmt.Errorf("creating temp file for cache write: %w", err)
+	}
+	if _, err := io.Copy(tmpFile, resp); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpFile.Name())
+		return nil, fmt.Errorf("writing response body to temp file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmpFile.Name())
+		return nil, fmt.Errorf("closing temp file: %w", err)
+	}
+	if err := os.Rename(tmpFile.Name(), path); err != nil {
+		_ = os.Remove(tmpFile.Name())
+		return nil, fmt.Errorf("renaming temp file to cache path: %w", err)
+	}
+	return nil, nil
 }
 
 func resolveName(tags map[string]interface{}) (string, error) {

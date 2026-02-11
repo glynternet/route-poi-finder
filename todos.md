@@ -74,22 +74,6 @@ The Overpass docs note that the `around` filter performs spherical distance calc
 
 ---
 
-## Add cache TTL or invalidation mechanism
-
-**File:** `main.go:1032-1036`
-**Type:** Data freshness
-**Effort:** Small
-
-Cached API responses persist indefinitely with no expiration. OSM data is continuously updated by contributors: new POIs are added, old ones are removed, tags are corrected. A query cached months ago may return stale data (e.g. a closed restaurant still appearing, a new water source missing).
-
-If a cached item is over 28 days old, it should be replaced. Check file modification time and re-query if the cache entry exceeds this threshold. A `--no-cache` flag to bypass the cache entirely would also help during iterative use.
-
-**References:**
-- Go os.FileInfo ModTime: https://pkg.go.dev/os#FileInfo
-- OSM data update frequency: https://wiki.openstreetmap.org/wiki/Planet.osm#Update_frequency
-
----
-
 ## Make Overpass API endpoint configurable
 
 **File:** `overpass/client.go` (endpoint construction)
