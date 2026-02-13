@@ -1024,6 +1024,9 @@ func resolveSymbol(tags map[string]interface{}) string {
 		{tags: map[string]string{"place": "neighbourhood"}, symbol: "City Hall"},
 		{tags: map[string]string{"waterway": "river"}, symbol: "Water Source"},
 		{tags: map[string]string{"waterway": "stream"}, symbol: "Water Source"},
+		{tags: map[string]string{"waterway": "waterfall"}, symbol: "Water Source"},
+		{tags: map[string]string{"natural": "spring"}, symbol: "Water Source"},
+		{tags: map[string]string{"ford": "yes"}, symbol: "Water Source"},
 	} {
 		match := true
 		for k, matcherV := range symbolMatchers.tags {
