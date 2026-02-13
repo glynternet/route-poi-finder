@@ -797,6 +797,31 @@ func nodes(
 	return responseElements, nil
 }
 
+// processWayElement converts a single way element into wayPoints by finding
+// route crossings or the closest approach point.
+func processWayElement(e element, routePoints []gpxgo.GPXPoint) []wayPoint {
+	if e.Type != `way` {
+		return nil
+	}
+	if len(e.Geometry) < 2 {
+		// Degenerate way: use the single geometry point if available
+		if len(e.Geometry) == 1 {
+			return []wayPoint{{ID: e.ID, Loc: e.Geometry[0], Tags: e.Tags}}
+		}
+		return nil
+	}
+
+	crossings, closest := wayRouteIntersections(e.Geometry, routePoints)
+	if len(crossings) > 0 {
+		var result []wayPoint
+		for _, c := range crossings {
+			result = append(result, wayPoint{ID: e.ID, Loc: c, Tags: e.Tags})
+		}
+		return result
+	}
+	return []wayPoint{{ID: e.ID, Loc: closest, Tags: e.Tags}}
+}
+
 func wayPoints(
 	ctx context.Context,
 	cacheDir string,
@@ -813,25 +838,7 @@ func wayPoints(
 
 	var result []wayPoint
 	for _, e := range responseElements {
-		if e.Type != `way` {
-			continue
-		}
-		if len(e.Geometry) < 2 {
-			// Degenerate way: use the single geometry point if available
-			if len(e.Geometry) == 1 {
-				result = append(result, wayPoint{ID: e.ID, Loc: e.Geometry[0], Tags: e.Tags})
-			}
-			continue
-		}
-
-		crossings, closest := wayRouteIntersections(e.Geometry, routePoints)
-		if len(crossings) > 0 {
-			for _, c := range crossings {
-				result = append(result, wayPoint{ID: e.ID, Loc: c, Tags: e.Tags})
-			}
-		} else {
-			result = append(result, wayPoint{ID: e.ID, Loc: closest, Tags: e.Tags})
-		}
+		result = append(result, processWayElement(e, routePoints)...)
 	}
 
 	return result, nil
