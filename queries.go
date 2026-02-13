@@ -139,7 +139,6 @@ var queries = []query{{
 		notValues: []string{
 			"drain",
 			"dam",
-			"stream", // may be good but is too high frequency to deal with atm
 			"ditch",
 			"canal",
 		},
