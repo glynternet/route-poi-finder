@@ -90,18 +90,17 @@ type Point struct {
 	Symbol      string  `json:"sym"`
 }
 
-// workUnit represents a single unit of work for the worker pool
+// workUnit represents a single split's worth of work for the worker pool.
+// All query categories are consolidated into a single Overpass union query.
 type workUnit struct {
 	splitIndex  int
-	queryIndex  int
-	query       query
+	queries     []query
 	routePoints []gpxgo.GPXPoint
 }
 
-// workResult contains the results from processing a single work unit
+// workResult contains the results from processing a single split.
 type workResult struct {
 	splitIndex int
-	queryIndex int
 	nodes      []element
 	wayPoints  []wayPoint
 }
@@ -258,54 +257,48 @@ func concurrentUnitsWorker[Unit any, Result any](
 	}
 }
 
-// unitProcessor returns a function that processes a single work unit,
-// querying the Overpass API for nodes and way centres with retry support.
+// unitProcessor returns a function that processes a single split by building
+// a consolidated Overpass union query across all categories, executing it via
+// queryResponseElementsRaw, and separating nodes from ways in the response.
 func unitProcessor(
 	ctx context.Context,
 	cacheDir string,
 	cacheTTL time.Duration,
 	queryClient func(ctx context.Context, query string) (*http.Response, error),
 	queryElementsWithRetry func(ctx context.Context, queryFn func() ([]element, error)) ([]element, error),
-	queryWayPointsWithRetry func(ctx context.Context, queryFn func() ([]wayPoint, error)) ([]wayPoint, error),
 ) func(unit workUnit) (workResult, error) {
 	return func(unit workUnit) (workResult, error) {
-		locus := 80
-		if unit.query.radius != 0 {
-			locus = unit.query.radius
-		}
+		log.Printf("Worker processing split %d", unit.splitIndex+1)
 
-		routeFilter, err := queryRouteFilter(locus, unit.routePoints)
+		renderedQuery, err := renderUnionQuery(unit.queries, unit.routePoints)
 		if err != nil {
-			return workResult{}, fmt.Errorf("split %d query %d: creating query route filter: %w",
-				unit.splitIndex+1, unit.queryIndex+1, err)
+			return workResult{}, fmt.Errorf("split %d: rendering union query: %w", unit.splitIndex+1, err)
 		}
 
-		log.Printf("Worker processing split %d, query %d", unit.splitIndex+1, unit.queryIndex+1)
-
-		nodeElements, err := queryElementsWithRetry(ctx, func() ([]element, error) {
-			return nodes(ctx, cacheDir, cacheTTL, queryClient, unit.query.conditions, routeFilter)
+		elements, err := queryElementsWithRetry(ctx, func() ([]element, error) {
+			return queryResponseElementsRaw(ctx, cacheDir, cacheTTL, queryClient, renderedQuery)
 		})
 		if err != nil {
-			return workResult{}, fmt.Errorf("split %d query %d: getting nodes: %w",
-				unit.splitIndex+1, unit.queryIndex+1, err)
+			return workResult{}, fmt.Errorf("split %d: querying elements: %w", unit.splitIndex+1, err)
 		}
 
-		wayPointElements, err := queryWayPointsWithRetry(ctx, func() ([]wayPoint, error) {
-			return wayPoints(ctx, cacheDir, cacheTTL, queryClient, unit.query.conditions, routeFilter, unit.routePoints)
-		})
-		if err != nil {
-			return workResult{}, fmt.Errorf("split %d query %d: getting way points: %w",
-				unit.splitIndex+1, unit.queryIndex+1, err)
+		var nodeElements []element
+		var wps []wayPoint
+		for _, e := range elements {
+			switch e.Type {
+			case "node":
+				nodeElements = append(nodeElements, e)
+			case "way":
+				wps = append(wps, processWayElement(e, unit.routePoints)...)
+			}
 		}
 
-		log.Printf("Split %d, query %d: %d nodes, %d way points",
-			unit.splitIndex+1, unit.queryIndex+1, len(nodeElements), len(wayPointElements))
+		log.Printf("Split %d: %d nodes, %d way points", unit.splitIndex+1, len(nodeElements), len(wps))
 
 		return workResult{
 			splitIndex: unit.splitIndex,
-			queryIndex: unit.queryIndex,
 			nodes:      nodeElements,
-			wayPoints:  wayPointElements,
+			wayPoints:  wps,
 		}, nil
 	}
 }
@@ -520,51 +513,41 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 
 	var workUnits []workUnit
 	for splitI, splitPoints := range splits {
-		for queryI, q := range queries {
-			workUnits = append(workUnits, workUnit{
-				splitIndex:  splitI,
-				queryIndex:  queryI,
-				query:       q,
-				routePoints: splitPoints,
-			})
-		}
+		workUnits = append(workUnits, workUnit{
+			splitIndex:  splitI,
+			queries:     queries,
+			routePoints: splitPoints,
+		})
 	}
 
-	log.Printf("Processing %d work units with %d workers", len(workUnits), workers)
+	log.Printf("Processing %d splits with %d workers", len(workUnits), workers)
 
 	retryConf := retryConfig{
 		maxRetries: retries,
 		baseDelay:  5 * time.Second,
 		maxDelay:   60 * time.Second,
 	}
-	processUnits := concurrentUnitsWorker(workers, unitProcessor(ctx, cacheDir, cacheTTL, client.Query, retrier[[]element](retryConf), retrier[[]wayPoint](retryConf)), failFast)
+	processUnits := concurrentUnitsWorker(workers, unitProcessor(ctx, cacheDir, cacheTTL, client.Query, retrier[[]element](retryConf)), failFast)
 	results, err := processUnits(workUnits...)
 	if err != nil {
 		return err
 	}
 
 	slices.SortFunc(results, func(a, b workResult) int {
-		if c := cmp.Compare(a.splitIndex, b.splitIndex); c != 0 {
-			return c
-		}
-		return cmp.Compare(a.queryIndex, b.queryIndex)
+		return cmp.Compare(a.splitIndex, b.splitIndex)
 	})
 
 	// Collect POIs (sequential - no mutex needed)
 	getPoint, getStats := point(namePrefix)
 	pois := make(map[Point]struct{})
-	queryPointCounts := make(occurrences[string])
 
 	for _, result := range results {
-		humanFriendlyQueryConditions := fmt.Sprintf("%+v", queries[result.queryIndex].conditions)
-
 		for _, node := range result.nodes {
 			pt, err := getPoint(node.Tags, LatLon{Lat: node.Lat, Lon: node.Lon})
 			if err != nil {
 				return fmt.Errorf("getting point for node(%v): %w", node, err)
 			}
 			pois[pt] = struct{}{}
-			queryPointCounts.mark(humanFriendlyQueryConditions)
 		}
 
 		for _, wp := range result.wayPoints {
@@ -573,7 +556,6 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 				return fmt.Errorf("getting point for wayPoint(%v): %w", wp, err)
 			}
 			pois[pt] = struct{}{}
-			queryPointCounts.mark(humanFriendlyQueryConditions)
 		}
 	}
 
@@ -616,11 +598,6 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 	}
 	for _, occurrence := range stats.tagValueOccurrences {
 		log.Println("Tag-Value:", occurrence.value, "=>", occurrence.freq)
-	}
-
-	topQueryCounts := queryPointCounts.topK(20)
-	for _, q := range topQueryCounts {
-		log.Println("Query:", q.value, "=>", q.freq)
 	}
 
 	return nil
@@ -743,20 +720,6 @@ func point(namePrefix string) (func(tags map[string]interface{}, latLon LatLon) 
 		}
 }
 
-const (
-	// outputBodyRecurse resolves way members into their constituent nodes and
-	// returns tags/geometry. Used for node queries where we need full body data.
-	// "out body" returns tags and geometry without the version/changeset/timestamp/user
-	// metadata that "out meta" includes. We don't use any of that metadata.
-	// "qt" (quadtile) sort avoids the default ID-based sort on the server, which the
-	// Overpass docs say has a cost. We don't depend on element ordering.
-	outputBodyRecurse = ");\n(._;>;);\nout body qt;"
-
-	// outputGeom returns way geometry inline (no separate node elements needed).
-	// Used for way queries where we need the full way shape for crossing detection.
-	outputGeom = ");\nout geom qt;"
-)
-
 func queryRouteFilter(locus int, route []gpxgo.GPXPoint) (string, error) {
 	if len(route) == 0 {
 		return "", fmt.Errorf(`no route points provided`)
@@ -775,26 +738,40 @@ func queryRouteFilter(locus int, route []gpxgo.GPXPoint) (string, error) {
 	return sb.String(), nil
 }
 
-func nodes(
-	ctx context.Context,
-	cacheDir string,
-	cacheTTL time.Duration,
-	queryClient func(ctx context.Context, query string) (*http.Response, error),
-	conditions []condition,
-	routeFilter string,
-) ([]element, error) {
-	responseElements, err := queryResponseElements(ctx, cacheDir, cacheTTL, queryClient, `node`, conditions, routeFilter, outputBodyRecurse)
-	if err != nil {
-		return nil, fmt.Errorf("getting query response elements: %w", err)
-	}
+// renderUnionQuery builds a single Overpass QL union query that combines all
+// query categories for both node and way element types. Each category gets its
+// own radius-specific route filter. Using `out geom qt;` returns way geometry
+// inline, avoiding the need for separate recurse queries.
+func renderUnionQuery(queries []query, routePoints []gpxgo.GPXPoint) (string, error) {
+	var sb strings.Builder
+	// timeout:120 tells the Overpass server to abort after 120s, matching our
+	// HTTP client timeout. Without this, the server default is 180s, meaning a
+	// query can keep running (and occupying a rate-limit slot) after the client
+	// has timed out and potentially retried with a new request.
+	sb.WriteString("[out:json][timeout:120];\n(\n")
 
-	for _, e := range responseElements {
-		if e.Type != `node` {
-			return nil, fmt.Errorf(`node query response returned non-node type element: %v`, e)
+	for _, q := range queries {
+		filters, err := renderConditionFilters(q.conditions)
+		if err != nil {
+			return "", fmt.Errorf("rendering condition filters for %+v: %w", q.conditions, err)
 		}
+
+		locus := 80
+		if q.radius != 0 {
+			locus = q.radius
+		}
+
+		routeFilter, err := queryRouteFilter(locus, routePoints)
+		if err != nil {
+			return "", fmt.Errorf("creating route filter: %w", err)
+		}
+
+		sb.WriteString("  node" + filters + routeFilter + ");\n")
+		sb.WriteString("  way" + filters + routeFilter + ");\n")
 	}
 
-	return responseElements, nil
+	sb.WriteString(");\nout geom qt;")
+	return sb.String(), nil
 }
 
 // processWayElement converts a single way element into wayPoints by finding
@@ -820,28 +797,6 @@ func processWayElement(e element, routePoints []gpxgo.GPXPoint) []wayPoint {
 		return result
 	}
 	return []wayPoint{{ID: e.ID, Loc: closest, Tags: e.Tags}}
-}
-
-func wayPoints(
-	ctx context.Context,
-	cacheDir string,
-	cacheTTL time.Duration,
-	queryClient func(ctx context.Context, query string) (*http.Response, error),
-	conditions []condition,
-	routeFilter string,
-	routePoints []gpxgo.GPXPoint,
-) ([]wayPoint, error) {
-	responseElements, err := queryResponseElements(ctx, cacheDir, cacheTTL, queryClient, `way`, conditions, routeFilter, outputGeom)
-	if err != nil {
-		return nil, fmt.Errorf("getting query response elements: %w", err)
-	}
-
-	var result []wayPoint
-	for _, e := range responseElements {
-		result = append(result, processWayElement(e, routePoints)...)
-	}
-
-	return result, nil
 }
 
 // renderConditionFilters renders conditions into Overpass QL bracket-filter
@@ -964,30 +919,6 @@ func queryResponseElementsRaw(
 		return nil, fmt.Errorf("closing response body: %w", err)
 	}
 	return r.Elements, nil
-}
-
-func queryResponseElements(
-	ctx context.Context,
-	cacheDir string,
-	cacheTTL time.Duration,
-	makeQueryRequest func(ctx context.Context, query string) (*http.Response, error),
-	queryType string,
-	queryConditions []condition,
-	routeFilter string,
-	outputSuffix string,
-) ([]element, error) {
-	filters, err := renderConditionFilters(queryConditions)
-	if err != nil {
-		return nil, fmt.Errorf("rendering condition filters: %w", err)
-	}
-
-	// timeout:120 tells the Overpass server to abort after 120s, matching our
-	// HTTP client timeout. Without this, the server default is 180s, meaning a
-	// query can keep running (and occupying a rate-limit slot) after the client
-	// has timed out and potentially retried with a new request.
-	renderedQuery := `[out:json][timeout:120];` + queryType + filters + routeFilter + outputSuffix
-
-	return queryResponseElementsRaw(ctx, cacheDir, cacheTTL, makeQueryRequest, renderedQuery)
 }
 
 func atomicSlurp(cacheDir string, resp io.Reader, path string) ([]element, error) {
