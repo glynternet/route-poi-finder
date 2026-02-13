@@ -702,12 +702,16 @@ func point(namePrefix string) (func(tags map[string]interface{}, latLon LatLon) 
 				tagOccurrences.mark(tag)
 				tagValueOccurrences.mark(tag + ":" + value.(string))
 			}
+			symbol := resolveSymbol(tags)
+			if symbol == "" {
+				log.Println("No symbol found for tags", tags)
+			}
 			nodePoint := Point{
 				Name:        namePrefix + name,
 				Lat:         latLon.Lat,
 				Lon:         latLon.Lon,
 				Description: string(desc),
-				Symbol:      resolveSymbol(tags),
+				Symbol:      symbol,
 			}
 			totalPoints++
 			return nodePoint, nil
