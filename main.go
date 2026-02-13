@@ -837,23 +837,11 @@ func wayPoints(
 	return result, nil
 }
 
-func queryResponseElements(
-	ctx context.Context,
-	cacheDir string,
-	cacheTTL time.Duration,
-	makeQueryRequest func(ctx context.Context, query string) (*http.Response, error),
-	queryType string,
-	queryConditions []condition,
-	routeFilter string,
-	outputSuffix string,
-) ([]element, error) {
+// renderConditionFilters renders conditions into Overpass QL bracket-filter
+// syntax, e.g. `[amenity~"^(bar|cafe)$"]`.
+func renderConditionFilters(conditions []condition) (string, error) {
 	var sb strings.Builder
-	// timeout:120 tells the Overpass server to abort after 120s, matching our
-	// HTTP client timeout. Without this, the server default is 180s, meaning a
-	// query can keep running (and occupying a rate-limit slot) after the client
-	// has timed out and potentially retried with a new request.
-	sb.WriteString(`[out:json][timeout:120];` + queryType)
-	for _, element := range queryConditions {
+	for _, element := range conditions {
 		var definedConditions int
 		for _, condition := range []bool{
 			len(element.notValues) > 0,
@@ -865,7 +853,7 @@ func queryResponseElements(
 			}
 		}
 		if definedConditions > 1 {
-			return nil, fmt.Errorf("query element must contain only one condition: 'not', 'values' or 'exists': %+v", element)
+			return "", fmt.Errorf("query element must contain only one condition: 'not', 'values' or 'exists': %+v", element)
 		}
 		var elementConditions []string
 		switch {
@@ -882,22 +870,29 @@ func queryResponseElements(
 			case ExistsNo:
 				elementConditions = []string{fmt.Sprintf(`!%s`, element.tag)}
 			default:
-				return nil, fmt.Errorf("unsupported exists value: %+v", element.exists)
+				return "", fmt.Errorf("unsupported exists value: %+v", element.exists)
 			}
 		default:
-			return nil, fmt.Errorf("query element contains no conditions: %+v", element)
+			return "", fmt.Errorf("query element contains no conditions: %+v", element)
 		}
 		for _, elementCondition := range elementConditions {
 			if _, err := sb.WriteString(`[` + elementCondition + `]`); err != nil {
-				return nil, fmt.Errorf("writing query element: %w", err)
+				return "", fmt.Errorf("writing query element: %w", err)
 			}
 		}
 	}
-	sb.WriteString(routeFilter)
-	sb.WriteString(outputSuffix)
+	return sb.String(), nil
+}
 
-	renderedQuery := sb.String()
-
+// queryResponseElementsRaw takes a pre-rendered Overpass query string and handles
+// caching, API execution, and JSON parsing of the response.
+func queryResponseElementsRaw(
+	ctx context.Context,
+	cacheDir string,
+	cacheTTL time.Duration,
+	makeQueryRequest func(ctx context.Context, query string) (*http.Response, error),
+	renderedQuery string,
+) ([]element, error) {
 	hasher := sha1.New()
 	if _, err := hasher.Write([]byte(renderedQuery)); err != nil {
 		return nil, fmt.Errorf("hashing query: %w", err)
@@ -908,8 +903,8 @@ func queryResponseElements(
 	queryStateFilePath := filepath.Join(cacheDir, sha)
 	if info, err := os.Stat(queryStateFilePath); err == nil {
 		if time.Since(info.ModTime()) > cacheTTL {
-			log.Printf("cache expired (age %s > ttl %s): %s:%+v",
-				time.Since(info.ModTime()).Round(time.Second), cacheTTL, queryType, queryConditions)
+			log.Printf("cache expired (age %s > ttl %s): %s",
+				time.Since(info.ModTime()).Round(time.Second), cacheTTL, renderedQuery[:min(80, len(renderedQuery))])
 		} else {
 			stored, err := os.Open(queryStateFilePath)
 			if err != nil {
@@ -925,10 +920,10 @@ func queryResponseElements(
 	}
 
 	if rc == nil {
-		log.Printf("query result not cached, making query to API: %s:%+v", queryType, queryConditions)
+		log.Printf("query result not cached, making query to API: %s", renderedQuery[:min(80, len(renderedQuery))])
 		resp, err := makeQueryRequest(ctx, renderedQuery)
 		if err != nil {
-			return nil, fmt.Errorf("posting query(%+v): %w", queryConditions, err)
+			return nil, fmt.Errorf("posting query: %w", err)
 		}
 		if resp.StatusCode != http.StatusOK {
 			_ = resp.Body.Close()
@@ -937,7 +932,7 @@ func queryResponseElements(
 		elements, err := atomicSlurp(cacheDir, resp.Body, queryStateFilePath)
 		if err != nil {
 			_ = resp.Body.Close()
-			return elements, fmt.Errorf("storing content into cache: (%q): %w", queryConditions, err)
+			return elements, fmt.Errorf("storing content into cache: %w", err)
 		}
 		if err := resp.Body.Close(); err != nil {
 			return nil, fmt.Errorf("closing response body: %w", err)
@@ -962,6 +957,30 @@ func queryResponseElements(
 		return nil, fmt.Errorf("closing response body: %w", err)
 	}
 	return r.Elements, nil
+}
+
+func queryResponseElements(
+	ctx context.Context,
+	cacheDir string,
+	cacheTTL time.Duration,
+	makeQueryRequest func(ctx context.Context, query string) (*http.Response, error),
+	queryType string,
+	queryConditions []condition,
+	routeFilter string,
+	outputSuffix string,
+) ([]element, error) {
+	filters, err := renderConditionFilters(queryConditions)
+	if err != nil {
+		return nil, fmt.Errorf("rendering condition filters: %w", err)
+	}
+
+	// timeout:120 tells the Overpass server to abort after 120s, matching our
+	// HTTP client timeout. Without this, the server default is 180s, meaning a
+	// query can keep running (and occupying a rate-limit slot) after the client
+	// has timed out and potentially retried with a new request.
+	renderedQuery := `[out:json][timeout:120];` + queryType + filters + routeFilter + outputSuffix
+
+	return queryResponseElementsRaw(ctx, cacheDir, cacheTTL, makeQueryRequest, renderedQuery)
 }
 
 func atomicSlurp(cacheDir string, resp io.Reader, path string) ([]element, error) {
