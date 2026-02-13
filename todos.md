@@ -1,58 +1,5 @@
 # Overpass API Usage: Audit Findings & TODOs
 
-## Use `out center` instead of `(._;>;); out body qt;` for way queries
-
-**File:** `main.go:892-894` (query suffix), `main.go:921-967` (`wayCentres` function)
-**Type:** Efficiency
-**Effort:** Medium
-
-The current approach for way queries uses the recurse-down pattern `(._;>;); out body qt;`, which fetches the matched ways *and every constituent node* of those ways. The `wayCentres()` function then manually computes a centroid by averaging node coordinates. This is expensive in terms of data transfer and server processing.
-
-The Overpass API provides `out center` specifically for this use case. It returns ways with a single representative coordinate (the center of the way's bounding box) without needing to recurse into constituent nodes. This is the standard approach for POI-style queries and is what tools like Overpass Turbo use.
-
-The trade-off is that `out center` returns the bounding box center rather than a coordinate average. For POI placement (the purpose of this tool), the difference is negligible.
-
-Switching to `out center` would:
-- Eliminate the `(._;>;)` recursion (the most expensive part of the query)
-- Dramatically reduce response sizes (no node elements returned for ways)
-- Remove the need for the `wayCentres()` manual centroid calculation
-- Reduce server-side processing time and memory usage
-
-**References:**
-- Overpass QL output formats: https://wiki.openstreetmap.org/wiki/Overpass_API/Overpass_QL#Output_Format_(out)
-- Overpass documentation on output modes and geometry: https://dev.overpass-api.de/overpass-doc/en/full_data/osm_types.html
-- OSM Help discussion on `out center`: https://help.openstreetmap.org/questions/60042/efficient-approach-to-get-center-coordinate-for-ways-via-overpass/
-
----
-
-## Combine node and way queries into a single union query
-
-**File:** `main.go:492-506` (`unitProcessor`), `main.go:900-967` (`nodes` and `wayCentres` functions)
-**Type:** Efficiency
-**Effort:** Medium
-
-Each work unit currently makes **2 separate API calls** per category per split: one querying `node[...]` and one querying `way[...]`. With the default `--split 5` and 16 query categories, this totals **160 API requests**. The Overpass documentation recommends building larger consolidated queries rather than many small ones, as the server can optimise better when it sees the full picture.
-
-These two queries can be combined into a single union query:
-
-```
-[out:json];
-(
-  node[amenity~"^(cafe|pub)$"](around:1000,...);
-  way[amenity~"^(cafe|pub)$"](around:1000,...);
-);
-out center;
-```
-
-With `out center`, both nodes (which return their own lat/lon) and ways (which return their bounding box center) produce a uniform output format. This halves the total request count from `2 * splits * 16` to `splits * 16` (160 to 80 with defaults).
-
-**References:**
-- Overpass QL union statements: https://wiki.openstreetmap.org/wiki/Overpass_API/Overpass_QL#Union
-- Overpass Language Guide on combining queries: https://wiki.openstreetmap.org/wiki/Overpass_API/Language_Guide
-- Overpass documentation on output with center: https://dev.overpass-api.de/overpass-doc/en/full_data/osm_types.html
-
----
-
 ## Downsample route points in `around` filter
 
 **File:** `main.go:861-897` (`queryRouteComponent`)
@@ -179,25 +126,6 @@ If stream volume is a concern, consider keeping `stream` but reducing the search
 - OSM wiki for `waterway=stream`: https://wiki.openstreetmap.org/wiki/Tag:waterway%3Dstream
 - OSM wiki for `waterway=river`: https://wiki.openstreetmap.org/wiki/Tag:waterway%3Driver
 - OSM Taginfo for waterway values: https://taginfo.openstreetmap.org/keys/waterway#values
-
----
-
-## Large area features produce misleading centroid points
-
-**File:** `main.go:921-967` (`wayCentres`), `main.go:147-160` (boundary queries)
-**Type:** Design observation
-**Effort:** Medium
-
-When a query matches large area features (national parks, nature reserves, large rivers), the centroid (or bounding box center with `out center`) may be far from the actual route. For example, a national park boundary way spanning 50km would produce a single POI point at its geographic center, which could be 25km from the route.
-
-This is inherent to reducing areas to points. For the tool's purpose of finding POIs along a route, a more useful approach for area features might be to:
-- Report the nearest point on the way's geometry to the route (requires `out geom`)
-- Simply report the feature's name and tags without a coordinate, as contextual information
-- Use `is_in` to find enclosing areas, which avoids the centroid problem entirely
-
-**References:**
-- Overpass QL `is_in` for area containment: https://wiki.openstreetmap.org/wiki/Overpass_API/Overpass_QL#By_area_(is_in)
-- Overpass QL `out geom` for full geometry: https://wiki.openstreetmap.org/wiki/Overpass_API/Overpass_QL#Output_Format_(out)
 
 ---
 
