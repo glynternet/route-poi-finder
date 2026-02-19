@@ -991,7 +991,7 @@ func resolveName(tags map[string]interface{}) (string, error) {
 }
 
 func resolveSymbol(tags map[string]interface{}) string {
-	var symbol string
+	var symbols []string
 	for _, symbolMatchers := range []struct {
 		tags   map[string]string
 		symbol string
@@ -1046,9 +1046,15 @@ func resolveSymbol(tags map[string]interface{}) string {
 			}
 		}
 		if match {
-			symbol = symbolMatchers.symbol
-			break
+			symbols = append(symbols, symbolMatchers.symbol)
 		}
 	}
-	return symbol
+
+	if len(symbols) == 0 {
+		return ""
+	}
+	if len(symbols) > 1 {
+		log.Printf("Multiple symbols matched, using first: %v", symbols)
+	}
+	return symbols[0]
 }
