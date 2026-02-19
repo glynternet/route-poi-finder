@@ -1012,6 +1012,7 @@ func resolveSymbol(tags map[string]interface{}) string {
 		{tags: map[string]string{"amenity": "pub"}, symbol: "Bar"},
 		{tags: map[string]string{"amenity": "bar"}, symbol: "Bar"},
 		{tags: map[string]string{"amenity": "cafe"}, symbol: "Restaurant"},
+		{tags: map[string]string{"shop": "coffee"}, symbol: "Restaurant"},
 		{tags: map[string]string{"tourism": "picnic_site"}, symbol: "Picnic Area"},
 		{tags: map[string]string{"amenity": "restaurant", "cuisine": "pizza"}, symbol: "Pizza"},
 		{tags: map[string]string{"amenity": "restaurant"}, symbol: "Restaurant"},
