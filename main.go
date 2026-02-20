@@ -26,6 +26,8 @@ import (
 
 	"github.com/glynternet/route-poi-finder/overpass"
 	gpxgo "github.com/tkrajina/gpxgo/gpx"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
 
 const (
@@ -1012,79 +1014,111 @@ func resolveSymbolAndCategories(tags map[string]interface{}) (string, []string) 
 	// category is meant to be a more fine-grained category for an item
 	var symbols []string
 	var categories []string
+	type matchConfig struct {
+		exact string
+		any   bool
+	}
+
+	static := func(v string) func(_ map[string]string) string {
+		return func(_ map[string]string) string {
+			return v
+		}
+	}
+
 	for _, symbolMatchers := range []struct {
-		tags     map[string]string
+		tags     map[string]matchConfig
 		symbol   string
-		category string // defauls to symbol if no category given
+		category func(tags map[string]string) string // defaults to symbol if no category given
 	}{
-		{tags: map[string]string{"shop": "convenience"}, symbol: "Shopping Center", category: "Resupply"},
-		{tags: map[string]string{"shop": "supermarket"}, symbol: "Shopping Center", category: "Resupply"},
-		{tags: map[string]string{"leisure": "park"}, symbol: "Park"},
-		{tags: map[string]string{"boundary": "protected_area"}, symbol: "Park"},
-		{tags: map[string]string{"amenity": "toilets"}, symbol: "Restroom"},
-		{tags: map[string]string{"amenity": "drinking_water"}, symbol: "Drinking Water"},
-		{tags: map[string]string{"natural": "peak"}, symbol: "Summit"},
-		{tags: map[string]string{"natural": "saddle"}, symbol: "Summit"},
-		{tags: map[string]string{"mountain_pass": "yes"}, symbol: "Summit"},
-		{tags: map[string]string{"tourism": "viewpoint"}, symbol: "Scenic Area", category: "Viewpoint"},
-		{tags: map[string]string{"amenity": "bicycle_repair_station"}, symbol: "Mine", category: "Bicycle Repair Station"},
-		{tags: map[string]string{"amenity": "fast_food"}, symbol: "Fast Food", category: "Restaurant"},
-		{tags: map[string]string{"amenity": "fuel"}, symbol: "Gas Station"},
-		{tags: map[string]string{"amenity": "pub"}, symbol: "Bar", category: "Restaurant"},
-		{tags: map[string]string{"amenity": "bar"}, symbol: "Bar", category: "Restaurant"},
-		{tags: map[string]string{"amenity": "cafe"}, symbol: "Restaurant"},
-		{tags: map[string]string{"shop": "coffee"}, symbol: "Restaurant"},
-		{tags: map[string]string{"tourism": "picnic_site"}, symbol: "Picnic Area", category: "Park"},
-		{tags: map[string]string{"amenity": "restaurant", "cuisine": "pizza"}, symbol: "Pizza", category: "Restaurant"},
-		{tags: map[string]string{"amenity": "restaurant"}, symbol: "Restaurant"},
-		{tags: map[string]string{"amenity": "ice_cream"}, symbol: "Fast Food", category: "Restaurant"},
-		{tags: map[string]string{"tourism": "camp_pitch"}, symbol: "Campground"},
-		{tags: map[string]string{"tourism": "camp_site"}, symbol: "Campground"},
-		{tags: map[string]string{"leisure": "nature_reserve"}, symbol: "Park"},
-		{tags: map[string]string{"amenity": "shelter"}, symbol: "Building", category: "Shelter"},
-		{tags: map[string]string{"amenity": "place_of_worship"}, symbol: "Church", category: "Place of worship"},
-		{tags: map[string]string{"place": "town"}, symbol: "City Hall", category: "Settlement"},
-		{tags: map[string]string{"place": "village"}, symbol: "City Hall", category: "Settlement"},
-		{tags: map[string]string{"place": "hamlet"}, symbol: "City Hall", category: "Settlement"},
-		{tags: map[string]string{"place": "city"}, symbol: "City Hall", category: "Settlement"},
-		{tags: map[string]string{"place": "neighbourhood"}, symbol: "City Hall", category: "Settlement"},
-		{tags: map[string]string{"waterway": "river"}, symbol: "Water Source"},
-		{tags: map[string]string{"waterway": "stream"}, symbol: "Water Source"},
-		{tags: map[string]string{"waterway": "waterfall"}, symbol: "Water Source"},
-		{tags: map[string]string{"natural": "spring"}, symbol: "Water Source"},
-		{tags: map[string]string{"ford": "yes"}, symbol: "Water Source"},
+		{tags: map[string]matchConfig{"shop": {exact: "convenience"}}, symbol: "Shopping Center", category: static("Resupply")},
+		{tags: map[string]matchConfig{"shop": {exact: "supermarket"}}, symbol: "Shopping Center", category: static("Resupply")},
+		{tags: map[string]matchConfig{"leisure": {exact: "park"}}, symbol: "Park"},
+		{tags: map[string]matchConfig{"boundary": {exact: "protected_area"}}, symbol: "Park"},
+		{tags: map[string]matchConfig{"amenity": {exact: "toilets"}}, symbol: "Restroom", category: static("Toilets")},
+		{tags: map[string]matchConfig{"amenity": {exact: "drinking_water"}}, symbol: "Drinking Water"},
+		{tags: map[string]matchConfig{"natural": {exact: "peak"}}, symbol: "Summit"},
+		{tags: map[string]matchConfig{"natural": {exact: "saddle"}}, symbol: "Summit"},
+		{tags: map[string]matchConfig{"mountain_pass": {exact: "yes"}}, symbol: "Summit"},
+		{tags: map[string]matchConfig{"tourism": {exact: "viewpoint"}}, symbol: "Scenic Area", category: static("Viewpoint")},
+		{tags: map[string]matchConfig{"amenity": {exact: "bicycle_repair_station"}}, symbol: "Mine", category: static("Bicycle Repair Station")},
+		{tags: map[string]matchConfig{"amenity": {exact: "fast_food"}}, symbol: "Fast Food", category: static("Restaurant")},
+		{tags: map[string]matchConfig{"amenity": {exact: "fuel"}}, symbol: "Gas Station"},
+		{tags: map[string]matchConfig{"amenity": {exact: "pub"}}, symbol: "Bar", category: static("Restaurant")},
+		{tags: map[string]matchConfig{"amenity": {exact: "bar"}}, symbol: "Bar", category: static("Restaurant")},
+		{tags: map[string]matchConfig{"amenity": {exact: "cafe"}}, symbol: "Restaurant"},
+		{tags: map[string]matchConfig{"shop": {exact: "coffee"}}, symbol: "Restaurant"},
+		{tags: map[string]matchConfig{"tourism": {exact: "picnic_site"}}, symbol: "Picnic Area", category: static("Park")},
+		{tags: map[string]matchConfig{"amenity": {exact: "restaurant"}, "cuisine": {exact: "pizza"}}, symbol: "Pizza", category: static("Restaurant")},
+		{tags: map[string]matchConfig{"amenity": {exact: "restaurant"}}, symbol: "Restaurant"},
+		{tags: map[string]matchConfig{"amenity": {exact: "ice_cream"}}, symbol: "Fast Food", category: static("Restaurant")},
+		{tags: map[string]matchConfig{"tourism": {exact: "camp_pitch"}}, symbol: "Campground"},
+		{tags: map[string]matchConfig{"tourism": {exact: "camp_site"}}, symbol: "Campground"},
+		{tags: map[string]matchConfig{"leisure": {exact: "nature_reserve"}}, symbol: "Park"},
+		{tags: map[string]matchConfig{"amenity": {exact: "shelter"}}, symbol: "Building", category: static("Shelter")},
+		{tags: map[string]matchConfig{"amenity": {exact: "place_of_worship"}}, symbol: "Church", category: static("Place of Worship")},
+		{tags: map[string]matchConfig{"place": {exact: "town"}}, symbol: "City Hall", category: static("Settlement")},
+		{tags: map[string]matchConfig{"place": {exact: "village"}}, symbol: "City Hall", category: static("Settlement")},
+		{tags: map[string]matchConfig{"place": {exact: "hamlet"}}, symbol: "City Hall", category: static("Settlement")},
+		{tags: map[string]matchConfig{"place": {exact: "city"}}, symbol: "City Hall", category: static("Settlement")},
+		{tags: map[string]matchConfig{"place": {exact: "neighbourhood"}}, symbol: "City Hall", category: static("Settlement")},
+		{tags: map[string]matchConfig{"waterway": {exact: "river"}}, symbol: "Water Source"},
+		{tags: map[string]matchConfig{"waterway": {exact: "stream"}}, symbol: "Water Source"},
+		{tags: map[string]matchConfig{"waterway": {exact: "waterfall"}}, symbol: "Water Source"},
+		{tags: map[string]matchConfig{"natural": {exact: "spring"}}, symbol: "Water Source"},
+		{tags: map[string]matchConfig{"ford": {exact: "yes"}}, symbol: "Water Source"},
+		{tags: map[string]matchConfig{"amenity": {any: true}}, category: func(tags map[string]string) string {
+			v := tags["amenity"]
+			if len(v) == 0 {
+				return v
+			}
+			v = strings.ReplaceAll(v, "_", " ")
+			v = cases.Title(language.Und).String(v)
+			v = strings.ReplaceAll(v, " Of ", " of ") // things like Place Of Worship look weird with capital O
+			return v
+		}},
 	} {
 		match := true
-		for k, matcherV := range symbolMatchers.tags {
+		matchedTags := make(map[string]string)
+		for k, matcher := range symbolMatchers.tags {
 			// Tags are map[string]interface{} from JSON decoding. Use a type
 			// assertion to string rather than comparing interface{} values
 			// directly, which would silently fail if the JSON decoder ever
 			// produced a non-string type for a tag value.
 			v, ok := tags[k].(string)
-			if !ok || v != matcherV {
+			if !ok {
 				match = false
 				break
 			}
+			if !matcher.any && matcher.exact != "" && matcher.exact != v {
+				match = false
+				break
+			}
+			matchedTags[k] = v
 		}
 		if match {
-			symbols = append(symbols, symbolMatchers.symbol)
-			if symbolMatchers.category != "" {
-				categories = append(categories, symbolMatchers.category)
-			} else {
+			if symbolMatchers.symbol != "" {
+				symbols = append(symbols, symbolMatchers.symbol)
+			}
+			if symbolMatchers.category != nil {
+				if category := symbolMatchers.category(matchedTags); category != "" {
+					categories = append(categories, category)
+				}
+			} else if symbolMatchers.symbol != "" {
 				categories = append(categories, symbolMatchers.symbol)
 			}
 		}
 	}
 
+	// sort and compact to rid of duplicates
 	slices.Sort(symbols)
-	slices.Compact(symbols)
+	symbols = slices.Compact(symbols)
+	slices.Sort(categories)
+	categories = slices.Compact(categories)
 	if len(symbols) == 0 {
-		return "", nil
+		return "", categories
 	}
 	if len(symbols) > 1 {
 		log.Printf("Multiple symbols matched, using first: %v", symbols)
 	}
-	slices.Sort(categories)
-	slices.Compact(categories)
 	return symbols[0], categories
 }
