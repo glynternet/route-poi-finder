@@ -14,6 +14,7 @@ var queries = []query{{
 			"fuel",
 			"ice_cream",
 			"marketplace",
+			"post_office",
 			"pub",
 			"restaurant",
 		},
