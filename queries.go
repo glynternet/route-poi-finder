@@ -45,18 +45,25 @@ var queries = []query{{
 		},
 	}},
 }, {
-	radius: 200,
+	radius: 1000,
 	conditions: []condition{{
-		// - - tourism~"^(alpine_hut|camp_pitch|camp_site|guest_house|hostel|picnic_site|viewpoint|wilderness_hut)$"
 		tag: "tourism",
 		values: []string{
 			"alpine_hut",
 			"camp_pitch",
 			"camp_site",
 			"guest_house",
+			"hotel",
 			"hostel",
+			"motel",
 			"wilderness_hut",
 		},
+	}},
+}, {
+	radius: 1000,
+	conditions: []condition{{
+		tag:    "accommodation",
+		exists: ExistsYes,
 	}},
 }, {
 	conditions: []condition{{

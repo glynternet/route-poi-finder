@@ -42,7 +42,8 @@ const (
 )
 
 type query struct {
-	radius     int
+	radius int
+	// conditions are AND'd when rendered as a query
 	conditions []condition
 }
 
@@ -1015,9 +1016,12 @@ func resolveSymbolAndCategories(tags map[string]interface{}) (string, []string) 
 	var symbols []string
 	var categories []string
 	type matchConfig struct {
-		exact string
-		any   bool
+		exact  string
+		any    []string
+		exists bool
 	}
+
+	matchedTags := make(map[string]string)
 
 	static := func(v string) func(_ map[string]string) string {
 		return func(_ map[string]string) string {
@@ -1030,43 +1034,41 @@ func resolveSymbolAndCategories(tags map[string]interface{}) (string, []string) 
 		symbol   string
 		category func(tags map[string]string) string // defaults to symbol if no category given
 	}{
-		{tags: map[string]matchConfig{"shop": {exact: "convenience"}}, symbol: "Shopping Center", category: static("Resupply")},
-		{tags: map[string]matchConfig{"shop": {exact: "supermarket"}}, symbol: "Shopping Center", category: static("Resupply")},
+		{tags: map[string]matchConfig{"shop": {any: []string{"convenience", "supermarket"}}}, symbol: "Shopping Center", category: static("Resupply")},
 		{tags: map[string]matchConfig{"leisure": {exact: "park"}}, symbol: "Park"},
 		{tags: map[string]matchConfig{"boundary": {exact: "protected_area"}}, symbol: "Park"},
 		{tags: map[string]matchConfig{"amenity": {exact: "toilets"}}, symbol: "Restroom", category: static("Toilets")},
 		{tags: map[string]matchConfig{"amenity": {exact: "drinking_water"}}, symbol: "Drinking Water"},
-		{tags: map[string]matchConfig{"natural": {exact: "peak"}}, symbol: "Summit"},
-		{tags: map[string]matchConfig{"natural": {exact: "saddle"}}, symbol: "Summit"},
+		{tags: map[string]matchConfig{"natural": {any: []string{"peak", "saddle"}}}, symbol: "Summit"},
 		{tags: map[string]matchConfig{"mountain_pass": {exact: "yes"}}, symbol: "Summit"},
 		{tags: map[string]matchConfig{"tourism": {exact: "viewpoint"}}, symbol: "Scenic Area", category: static("Viewpoint")},
 		{tags: map[string]matchConfig{"amenity": {exact: "bicycle_repair_station"}}, symbol: "Mine", category: static("Bicycle Repair Station")},
 		{tags: map[string]matchConfig{"amenity": {exact: "fast_food"}}, symbol: "Fast Food", category: static("Restaurant")},
 		{tags: map[string]matchConfig{"amenity": {exact: "fuel"}}, symbol: "Gas Station"},
-		{tags: map[string]matchConfig{"amenity": {exact: "pub"}}, symbol: "Bar", category: static("Restaurant")},
-		{tags: map[string]matchConfig{"amenity": {exact: "bar"}}, symbol: "Bar", category: static("Restaurant")},
+		{tags: map[string]matchConfig{"amenity": {any: []string{"pub", "bar"}}}, symbol: "Bar", category: static("Restaurant")},
 		{tags: map[string]matchConfig{"amenity": {exact: "cafe"}}, symbol: "Restaurant"},
 		{tags: map[string]matchConfig{"shop": {exact: "coffee"}}, symbol: "Restaurant"},
 		{tags: map[string]matchConfig{"tourism": {exact: "picnic_site"}}, symbol: "Picnic Area", category: static("Park")},
 		{tags: map[string]matchConfig{"amenity": {exact: "restaurant"}, "cuisine": {exact: "pizza"}}, symbol: "Pizza", category: static("Restaurant")},
 		{tags: map[string]matchConfig{"amenity": {exact: "restaurant"}}, symbol: "Restaurant"},
 		{tags: map[string]matchConfig{"amenity": {exact: "ice_cream"}}, symbol: "Fast Food", category: static("Restaurant")},
-		{tags: map[string]matchConfig{"tourism": {exact: "camp_pitch"}}, symbol: "Campground"},
-		{tags: map[string]matchConfig{"tourism": {exact: "camp_site"}}, symbol: "Campground"},
+		{tags: map[string]matchConfig{"tourism": {any: []string{"camp_pitch", "camp_site"}}}, symbol: "Campground"},
+		{tags: map[string]matchConfig{"tourism": {any: []string{
+			"alpine_hut",
+			"guest_house",
+			"hotel",
+			"hostel",
+			"motel",
+			"wilderness_hut",
+		}}}, symbol: "Building", category: static("Accommodation")},
+		{tags: map[string]matchConfig{"accommodation": {exists: true}}, symbol: "Building", category: static("Accommodation")},
 		{tags: map[string]matchConfig{"leisure": {exact: "nature_reserve"}}, symbol: "Park"},
 		{tags: map[string]matchConfig{"amenity": {exact: "shelter"}}, symbol: "Building", category: static("Shelter")},
 		{tags: map[string]matchConfig{"amenity": {exact: "place_of_worship"}}, symbol: "Church", category: static("Place of Worship")},
-		{tags: map[string]matchConfig{"place": {exact: "town"}}, symbol: "City Hall", category: static("Settlement")},
-		{tags: map[string]matchConfig{"place": {exact: "village"}}, symbol: "City Hall", category: static("Settlement")},
-		{tags: map[string]matchConfig{"place": {exact: "hamlet"}}, symbol: "City Hall", category: static("Settlement")},
-		{tags: map[string]matchConfig{"place": {exact: "city"}}, symbol: "City Hall", category: static("Settlement")},
-		{tags: map[string]matchConfig{"place": {exact: "neighbourhood"}}, symbol: "City Hall", category: static("Settlement")},
-		{tags: map[string]matchConfig{"waterway": {exact: "river"}}, symbol: "Water Source"},
-		{tags: map[string]matchConfig{"waterway": {exact: "stream"}}, symbol: "Water Source"},
-		{tags: map[string]matchConfig{"waterway": {exact: "waterfall"}}, symbol: "Water Source"},
-		{tags: map[string]matchConfig{"natural": {exact: "spring"}}, symbol: "Water Source"},
+		{tags: map[string]matchConfig{"place": {any: []string{"town", "village", "hamlet", "city", "neighbourhood"}}}, symbol: "City Hall", category: static("Settlement")},
+		{tags: map[string]matchConfig{"waterway": {any: []string{"river", "stream", "waterfall", "spring"}}}, symbol: "Water Source"},
 		{tags: map[string]matchConfig{"ford": {exact: "yes"}}, symbol: "Water Source"},
-		{tags: map[string]matchConfig{"amenity": {any: true}}, category: func(tags map[string]string) string {
+		{tags: map[string]matchConfig{"amenity": {exists: true}}, category: func(tags map[string]string) string {
 			v := tags["amenity"]
 			if len(v) == 0 {
 				return v
@@ -1078,7 +1080,6 @@ func resolveSymbolAndCategories(tags map[string]interface{}) (string, []string) 
 		}},
 	} {
 		match := true
-		matchedTags := make(map[string]string)
 		for k, matcher := range symbolMatchers.tags {
 			// Tags are map[string]interface{} from JSON decoding. Use a type
 			// assertion to string rather than comparing interface{} values
@@ -1089,7 +1090,9 @@ func resolveSymbolAndCategories(tags map[string]interface{}) (string, []string) 
 				match = false
 				break
 			}
-			if !matcher.any && matcher.exact != "" && matcher.exact != v {
+			if !matcher.exists &&
+				((matcher.exact != "" && matcher.exact != v) ||
+					(len(matcher.any) > 0 && !slices.Contains(matcher.any, v))) {
 				match = false
 				break
 			}
@@ -1109,16 +1112,36 @@ func resolveSymbolAndCategories(tags map[string]interface{}) (string, []string) 
 		}
 	}
 
+	// do not sort symbols because they are in priority order
 	// sort and compact to rid of duplicates
-	slices.Sort(symbols)
-	symbols = slices.Compact(symbols)
+
+	symbols = slices.CompactFunc(symbols, orderRetainingUniqCompact[string]())
+	// do sort categories because they are a set
 	slices.Sort(categories)
 	categories = slices.Compact(categories)
 	if len(symbols) == 0 {
 		return "", categories
 	}
 	if len(symbols) > 1 {
-		log.Printf("Multiple symbols matched, using first: %v", symbols)
+		log.Printf("Multiple symbols matched for tags (%v), using first: %v", matchedTags, symbols)
 	}
 	return symbols[0], categories
+}
+
+// orderRetainingUniqCompact provides a function to pass to slices.CompactFunc that will compact a slice in a way that
+// retains only the first instance of a seen value.
+// e.g. ["a", "b", "a", "c", "c", "a", "b"] will compact to ["a", "b", "c"]
+func orderRetainingUniqCompact[E comparable]() func(E, E) bool {
+	seen := make(map[E]struct{})
+	return func(next E, prev E) bool {
+		if next == prev {
+			seen[next] = struct{}{}
+			return true
+		}
+		_, ok := seen[next]
+		if !ok {
+			seen[next] = struct{}{}
+		}
+		return ok
+	}
 }
