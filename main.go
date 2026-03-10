@@ -68,6 +68,16 @@ type element struct {
 	Nodes    []int64                `json:"nodes"`
 	Tags     map[string]interface{} `json:"tags"`
 	Geometry []LatLon               `json:"geometry"`
+	Members  []member               `json:"members"`
+}
+
+type member struct {
+	Type     string   `json:"type"`
+	Ref      int64    `json:"ref"`
+	Role     string   `json:"role"`
+	Lat      float64  `json:"lat"`
+	Lon      float64  `json:"lon"`
+	Geometry []LatLon `json:"geometry"`
 }
 
 // MODEL
@@ -271,11 +281,12 @@ func unitProcessor(
 	cacheTTL time.Duration,
 	queryClient func(ctx context.Context, query string) (*http.Response, error),
 	queryElementsWithRetry func(ctx context.Context, queryFn func() ([]element, error)) ([]element, error),
+	queryTimeout time.Duration,
 ) func(unit workUnit) (workResult, error) {
 	return func(unit workUnit) (workResult, error) {
 		log.Printf("Worker processing split %d", unit.splitIndex+1)
 
-		renderedQuery, err := renderUnionQuery(unit.queries, unit.routePoints)
+		renderedQuery, err := renderUnionQuery(unit.queries, unit.routePoints, queryTimeout)
 		if err != nil {
 			return workResult{}, fmt.Errorf("split %d: rendering union query: %w", unit.splitIndex+1, err)
 		}
@@ -295,6 +306,8 @@ func unitProcessor(
 				nodeElements = append(nodeElements, e)
 			case "way":
 				wps = append(wps, processWayElement(e, unit.routePoints)...)
+			case "relation":
+				wps = append(wps, processRelationElement(e, unit.routePoints)...)
 			}
 		}
 
@@ -450,9 +463,11 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 	ctx := context.Background()
 
 	// Create and start the rate-limited Overpass client
+	const queryTimeout = 180 * time.Second
 	client := overpass.NewClient(
 		"https://overpass-api.de/api/interpreter",
 		"https://overpass-api.de/api/status",
+		queryTimeout,
 	)
 	if err := client.Start(ctx); err != nil {
 		return fmt.Errorf("starting overpass client: %w", err)
@@ -532,7 +547,7 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 		baseDelay:  5 * time.Second,
 		maxDelay:   60 * time.Second,
 	}
-	processUnits := concurrentUnitsWorker(workers, unitProcessor(ctx, cacheDir, cacheTTL, client.Query, retrier[[]element](retryConf)), failFast)
+	processUnits := concurrentUnitsWorker(workers, unitProcessor(ctx, cacheDir, cacheTTL, client.Query, retrier[[]element](retryConf), queryTimeout), failFast)
 	results, err := processUnits(workUnits...)
 	if err != nil {
 		return err
@@ -766,13 +781,9 @@ func queryRouteFilter(locus int, route []gpxgo.GPXPoint) (string, error) {
 // query categories for both node and way element types. Each category gets its
 // own radius-specific route filter. Using `out geom qt;` returns way geometry
 // inline, avoiding the need for separate recurse queries.
-func renderUnionQuery(queries []query, routePoints []gpxgo.GPXPoint) (string, error) {
+func renderUnionQuery(queries []query, routePoints []gpxgo.GPXPoint, timeout time.Duration) (string, error) {
 	var sb strings.Builder
-	// timeout:120 tells the Overpass server to abort after 120s, matching our
-	// HTTP client timeout. Without this, the server default is 180s, meaning a
-	// query can keep running (and occupying a rate-limit slot) after the client
-	// has timed out and potentially retried with a new request.
-	sb.WriteString("[out:json][timeout:120];\n(\n")
+	sb.WriteString(fmt.Sprintf("[out:json][timeout:%d];\n(\n", int(timeout.Seconds())))
 
 	for _, q := range queries {
 		filters, err := renderConditionFilters(q.conditions)
@@ -792,6 +803,7 @@ func renderUnionQuery(queries []query, routePoints []gpxgo.GPXPoint) (string, er
 
 		sb.WriteString("  node" + filters + routeFilter + ");\n")
 		sb.WriteString("  way" + filters + routeFilter + ");\n")
+		sb.WriteString("  rel" + filters + routeFilter + ");\n")
 	}
 
 	sb.WriteString(");\nout geom qt;")
@@ -821,6 +833,67 @@ func processWayElement(e element, routePoints []gpxgo.GPXPoint) []wayPoint {
 		return result
 	}
 	return []wayPoint{{ID: e.ID, Loc: closest, Tags: e.Tags}}
+}
+
+// processRelationElement converts a relation element into wayPoints by
+// processing each way member's geometry independently for route crossings.
+func processRelationElement(e element, routePoints []gpxgo.GPXPoint) []wayPoint {
+	var allCrossings []LatLon
+	var globalClosest *LatLon
+	globalClosestDistSq := math.Inf(1)
+	hadWayGeometry := false
+
+	for _, m := range e.Members {
+		if m.Type != "way" || len(m.Geometry) < 2 {
+			continue
+		}
+		hadWayGeometry = true
+		crossings, closest := wayRouteIntersections(m.Geometry, routePoints)
+		allCrossings = append(allCrossings, crossings...)
+
+		// Find minimum squared distance from this member's closest point to any route point
+		minDistSq := math.Inf(1)
+		for _, rp := range routePoints {
+			dLat := closest.Lat - rp.Latitude
+			dLon := closest.Lon - rp.Longitude
+			distSq := dLat*dLat + dLon*dLon
+			if distSq < minDistSq {
+				minDistSq = distSq
+			}
+		}
+		if minDistSq < globalClosestDistSq {
+			c := closest
+			globalClosest = &c
+			globalClosestDistSq = minDistSq
+		}
+	}
+
+	if hadWayGeometry {
+		if len(allCrossings) > 0 {
+			var result []wayPoint
+			for _, c := range allCrossings {
+				result = append(result, wayPoint{ID: e.ID, Loc: c, Tags: e.Tags})
+			}
+			return result
+		}
+		if globalClosest != nil {
+			return []wayPoint{{ID: e.ID, Loc: *globalClosest, Tags: e.Tags}}
+		}
+		return nil
+	}
+
+	// Fallback: use node members as point locations
+	var result []wayPoint
+	for _, m := range e.Members {
+		if m.Type == "node" && (m.Lat != 0 || m.Lon != 0) {
+			result = append(result, wayPoint{
+				ID:   e.ID,
+				Loc:  LatLon{Lat: m.Lat, Lon: m.Lon},
+				Tags: e.Tags,
+			})
+		}
+	}
+	return result
 }
 
 // renderConditionFilters renders conditions into Overpass QL bracket-filter
@@ -915,10 +988,9 @@ func queryResponseElementsRaw(
 			_ = resp.Body.Close()
 			return nil, &httpStatusError{statusCode: resp.StatusCode, status: resp.Status}
 		}
-		elements, err := atomicSlurp(cacheDir, resp.Body, queryStateFilePath)
-		if err != nil {
+		if err := atomicSlurp(cacheDir, resp.Body, queryStateFilePath); err != nil {
 			_ = resp.Body.Close()
-			return elements, fmt.Errorf("storing content into cache: %w", err)
+			return nil, fmt.Errorf("storing content into cache: %w", err)
 		}
 		if err := resp.Body.Close(); err != nil {
 			return nil, fmt.Errorf("closing response body: %w", err)
@@ -945,25 +1017,25 @@ func queryResponseElementsRaw(
 	return r.Elements, nil
 }
 
-func atomicSlurp(cacheDir string, resp io.Reader, path string) ([]element, error) {
+func atomicSlurp(cacheDir string, resp io.Reader, path string) error {
 	tmpFile, err := os.CreateTemp(cacheDir, ".tmp-*")
 	if err != nil {
-		return nil, fmt.Errorf("creating temp file for cache write: %w", err)
+		return fmt.Errorf("creating temp file for cache write: %w", err)
 	}
 	if _, err := io.Copy(tmpFile, resp); err != nil {
 		_ = tmpFile.Close()
 		_ = os.Remove(tmpFile.Name())
-		return nil, fmt.Errorf("writing response body to temp file: %w", err)
+		return fmt.Errorf("writing response body to temp file: %w", err)
 	}
 	if err := tmpFile.Close(); err != nil {
 		_ = os.Remove(tmpFile.Name())
-		return nil, fmt.Errorf("closing temp file: %w", err)
+		return fmt.Errorf("closing temp file: %w", err)
 	}
 	if err := os.Rename(tmpFile.Name(), path); err != nil {
 		_ = os.Remove(tmpFile.Name())
-		return nil, fmt.Errorf("renaming temp file to cache path: %w", err)
+		return fmt.Errorf("renaming temp file to cache path: %w", err)
 	}
-	return nil, nil
+	return nil
 }
 
 func resolveName(tags map[string]interface{}) (string, error) {
@@ -1066,6 +1138,7 @@ func resolveSymbolAndCategories(tags map[string]interface{}) (string, []string) 
 		{tags: map[string]matchConfig{"amenity": {exact: "shelter"}}, symbol: "Building", category: static("Shelter")},
 		{tags: map[string]matchConfig{"amenity": {exact: "place_of_worship"}}, symbol: "Church", category: static("Place of Worship")},
 		{tags: map[string]matchConfig{"place": {any: []string{"town", "village", "hamlet", "city", "neighbourhood"}}}, symbol: "City Hall", category: static("Settlement")},
+		{tags: map[string]matchConfig{"natural": {exact: "spring"}}, symbol: "Water Source"},
 		{tags: map[string]matchConfig{"waterway": {any: []string{"river", "stream", "waterfall", "spring"}}}, symbol: "Water Source"},
 		{tags: map[string]matchConfig{"ford": {exact: "yes"}}, symbol: "Water Source"},
 		{tags: map[string]matchConfig{"amenity": {exists: true}}, category: func(tags map[string]string) string {

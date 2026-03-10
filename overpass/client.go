@@ -36,10 +36,10 @@ type slotRequest struct {
 
 // NewClient creates a new rate-limited Overpass client.
 // Call Start() before using Query().
-func NewClient(interpreterEndpoint, statusEndpoint string) *Client {
+func NewClient(interpreterEndpoint, statusEndpoint string, timeout time.Duration) *Client {
 	return &Client{
 		interpreterEndpoint: interpreterEndpoint,
-		httpClient:          &http.Client{Timeout: 120 * time.Second},
+		httpClient:          &http.Client{Timeout: timeout},
 		fetchStatus:         StatusFetcher(statusEndpoint),
 		requests:            make(chan slotRequest),
 		done:                make(chan struct{}),
