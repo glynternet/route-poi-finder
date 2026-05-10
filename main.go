@@ -898,6 +898,12 @@ func processRelationElement(e element, routePoints []gpxgo.GPXPoint) []wayPoint 
 
 // renderConditionFilters renders conditions into Overpass QL bracket-filter
 // syntax, e.g. `[amenity~"^(bar|cafe)$"]`.
+//
+// Note: Overpass QL does not accept empty-string equality like `[key=""]`
+// (see https://github.com/drolbr/Overpass-API/issues/92), so callers cannot
+// match tags whose value is the empty string via `values`. The negated form
+// `[key!=""]` is accepted and is the idiomatic way to require a non-empty
+// value (use `notValues: []string{""}`).
 func renderConditionFilters(conditions []condition) (string, error) {
 	var sb strings.Builder
 	for _, element := range conditions {
