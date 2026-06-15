@@ -120,6 +120,112 @@ type workResult struct {
 	wayPoints  []wayPoint
 }
 
+// endpointSpec describes one Overpass server configured via --overpass-endpoint.
+// Concurrency is only consulted when the server reports Rate limit: 0 (unlimited).
+type endpointSpec struct {
+	Name        string
+	Interpreter string
+	Status      string
+	Concurrency int // used only for unlimited servers; 0 means use default
+}
+
+// endpointFlag implements flag.Value for repeatable --overpass-endpoint.
+// Each value is NAME=INTERPRETER_URL,STATUS_URL[,CONCURRENCY].
+type endpointFlag struct {
+	specs []endpointSpec
+	set   bool
+}
+
+func (f *endpointFlag) String() string {
+	var parts []string
+	for _, s := range f.specs {
+		parts = append(parts, s.Name)
+	}
+	return strings.Join(parts, ",")
+}
+
+func (f *endpointFlag) Set(v string) error {
+	name, rest, ok := strings.Cut(v, "=")
+	if !ok || name == "" {
+		return fmt.Errorf("expected NAME=INTERPRETER,STATUS[,CONCURRENCY], got %q", v)
+	}
+	parts := strings.Split(rest, ",")
+	if len(parts) < 2 || len(parts) > 3 {
+		return fmt.Errorf("expected 2 or 3 comma-separated values after %q=, got %d", name, len(parts))
+	}
+	spec := endpointSpec{Name: name, Interpreter: parts[0], Status: parts[1]}
+	if len(parts) == 3 {
+		n, err := strconv.Atoi(parts[2])
+		if err != nil || n < 1 {
+			return fmt.Errorf("invalid concurrency %q for endpoint %q: must be positive integer", parts[2], name)
+		}
+		spec.Concurrency = n
+	}
+	f.specs = append(f.specs, spec)
+	f.set = true
+	return nil
+}
+
+const defaultUnlimitedConcurrency = 4
+
+func defaultEndpoints() []endpointSpec {
+	return []endpointSpec{
+		{
+			Name:        "de",
+			Interpreter: "https://overpass-api.de/api/interpreter",
+			Status:      "https://overpass-api.de/api/status",
+		},
+		{
+			Name:        "pc",
+			Interpreter: "https://overpass.private.coffee/api/interpreter",
+			Status:      "https://overpass.private.coffee/api/status",
+			Concurrency: defaultUnlimitedConcurrency,
+		},
+	}
+}
+
+// namedClient pairs an Overpass client with the human-readable endpoint name
+// used for logging which server handled which split.
+type namedClient struct {
+	name   string
+	client *overpass.Client
+}
+
+// clientWorkers binds a named client to the number of worker goroutines that
+// should pull from the shared jobs channel and run queries through it.
+type clientWorkers struct {
+	client namedClient
+	count  int
+}
+
+// apportionWorkers distributes a target total worker count across clients in
+// proportion to each client's natural budget. The largest-budget client absorbs
+// any rounding remainder. Each client gets at least 1 worker.
+func apportionWorkers(in []clientWorkers, target, totalNatural int) []clientWorkers {
+	if totalNatural <= 0 || target <= 0 {
+		return in
+	}
+	out := make([]clientWorkers, len(in))
+	assigned := 0
+	largest := 0
+	for i, cw := range in {
+		share := (cw.count * target) / totalNatural
+		if share < 1 {
+			share = 1
+		}
+		out[i] = clientWorkers{client: cw.client, count: share}
+		assigned += share
+		if cw.count > in[largest].count {
+			largest = i
+		}
+	}
+	// Hand any rounding remainder to the largest-budget client.
+	if assigned < target {
+		out[largest].count += target - assigned
+	}
+	return out
+}
+
 // retryConfig holds retry settings
 type retryConfig struct {
 	maxRetries int
@@ -195,8 +301,8 @@ func retrier[T any](conf retryConfig) func(ctx context.Context, queryFn func() (
 // If failFast is true, processing stops on the first error.
 // If failFast is false, all errors are collected and returned joined.
 func concurrentUnitsWorker[Unit any, Result any](
-	workerCount int,
-	processUnit func(unit Unit) (Result, error),
+	workersByClient []clientWorkers,
+	processUnit func(client namedClient, unit Unit) (Result, error),
 	failFast bool,
 ) func(units ...Unit) ([]Result, error) {
 	type resultOrError struct {
@@ -211,24 +317,26 @@ func concurrentUnitsWorker[Unit any, Result any](
 		defer cancel()
 
 		var wg sync.WaitGroup
-		for i := 0; i < workerCount; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for unit := range jobs {
-					select {
-					case <-ctx.Done():
-						return
-					default:
+		for _, cw := range workersByClient {
+			for i := 0; i < cw.count; i++ {
+				wg.Add(1)
+				go func(c namedClient) {
+					defer wg.Done()
+					for unit := range jobs {
+						select {
+						case <-ctx.Done():
+							return
+						default:
+						}
+						result, err := processUnit(c, unit)
+						select {
+						case <-ctx.Done():
+							return
+						case results <- resultOrError{result, err}:
+						}
 					}
-					result, err := processUnit(unit)
-					select {
-					case <-ctx.Done():
-						return
-					case results <- resultOrError{result, err}:
-					}
-				}
-			}()
+				}(cw.client)
+			}
 		}
 
 		go func() {
@@ -279,12 +387,11 @@ func unitProcessor(
 	ctx context.Context,
 	cacheDir string,
 	cacheTTL time.Duration,
-	queryClient func(ctx context.Context, query string) (*http.Response, error),
 	queryElementsWithRetry func(ctx context.Context, queryFn func() ([]element, error)) ([]element, error),
 	queryTimeout time.Duration,
-) func(unit workUnit) (workResult, error) {
-	return func(unit workUnit) (workResult, error) {
-		log.Printf("Worker processing split %d", unit.splitIndex+1)
+) func(c namedClient, unit workUnit) (workResult, error) {
+	return func(c namedClient, unit workUnit) (workResult, error) {
+		log.Printf("Worker [%s] processing split %d", c.name, unit.splitIndex+1)
 
 		renderedQuery, err := renderUnionQuery(unit.queries, unit.routePoints, queryTimeout)
 		if err != nil {
@@ -292,10 +399,10 @@ func unitProcessor(
 		}
 
 		elements, err := queryElementsWithRetry(ctx, func() ([]element, error) {
-			return queryResponseElementsRaw(ctx, cacheDir, cacheTTL, queryClient, renderedQuery)
+			return queryResponseElementsRaw(ctx, cacheDir, cacheTTL, c.client.Query, renderedQuery)
 		})
 		if err != nil {
-			return workResult{}, fmt.Errorf("split %d: querying elements: %w", unit.splitIndex+1, err)
+			return workResult{}, fmt.Errorf("split %d [%s]: querying elements: %w", unit.splitIndex+1, c.name, err)
 		}
 
 		var nodeElements []element
@@ -341,7 +448,13 @@ func main() {
 	}
 	cacheDir := flag.String(`cache-dir`, defaultCacheDir, `directory to cache results in`)
 	cacheTTL := flag.Duration(`cache-ttl`, 28*24*time.Hour, `maximum age of cached API responses before re-querying`)
+	var endpoints endpointFlag
+	flag.Var(&endpoints, `overpass-endpoint`, `Overpass server as NAME=INTERPRETER_URL,STATUS_URL[,CONCURRENCY] (repeatable). CONCURRENCY only used when the server reports unlimited rate. If unset, defaults to overpass-api.de and overpass.private.coffee.`)
 	flag.Parse()
+
+	if !endpoints.set {
+		endpoints.specs = defaultEndpoints()
+	}
 
 	if *workers < 0 {
 		log.Println("--workers must be at least 0")
@@ -357,7 +470,7 @@ func main() {
 		log.Println("must provide gpx file arg")
 		os.Exit(1)
 	}
-	if err := mainErr(args[0], *namePrefix, *split, *workers, *retries, *failFast, *cacheDir, *cacheTTL, *out); err != nil {
+	if err := mainErr(args[0], *namePrefix, *split, *workers, *retries, *failFast, *cacheDir, *cacheTTL, *out, endpoints.specs); err != nil {
 		log.Println(err.Error())
 		os.Exit(1)
 	}
@@ -455,28 +568,60 @@ func wayRouteIntersections(wayGeometry []LatLon, routePoints []gpxgo.GPXPoint) (
 	return crossings, closest
 }
 
-func mainErr(file string, namePrefix string, split uint, workers int, retries int, failFast bool, cacheDir string, cacheTTL time.Duration, out string) error {
+func mainErr(file string, namePrefix string, split uint, workers int, retries int, failFast bool, cacheDir string, cacheTTL time.Duration, out string, endpoints []endpointSpec) error {
 	if split == 0 {
 		return fmt.Errorf("--split must be greater than 0")
+	}
+	if len(endpoints) == 0 {
+		return fmt.Errorf("no overpass endpoints configured")
 	}
 
 	ctx := context.Background()
 
-	// Create and start the rate-limited Overpass client
+	// Create and start one Overpass client per configured endpoint.
 	const queryTimeout = 180 * time.Second
-	client := overpass.NewClient(
-		"https://overpass-api.de/api/interpreter",
-		"https://overpass-api.de/api/status",
-		queryTimeout,
-	)
-	if err := client.Start(ctx); err != nil {
-		return fmt.Errorf("starting overpass client: %w", err)
-	}
-	defer client.Close()
+	var clients []namedClient
+	var perClientWorkers []clientWorkers
+	for _, ep := range endpoints {
+		c := overpass.NewClient(ep.Interpreter, ep.Status, queryTimeout)
+		if err := c.Start(ctx); err != nil {
+			log.Printf("WARN: starting overpass client %q: %v (skipping)", ep.Name, err)
+			continue
+		}
+		defer c.Close()
 
+		var natural int
+		if c.Unlimited() {
+			natural = ep.Concurrency
+			if natural <= 0 {
+				natural = defaultUnlimitedConcurrency
+			}
+			log.Printf("Overpass server %q ready: unlimited (using concurrency=%d)", ep.Name, natural)
+		} else {
+			natural = c.RateLimit()
+			log.Printf("Overpass server %q ready: rate limit=%d", ep.Name, natural)
+		}
+
+		nc := namedClient{name: ep.Name, client: c}
+		clients = append(clients, nc)
+		perClientWorkers = append(perClientWorkers, clientWorkers{client: nc, count: natural})
+	}
+	if len(clients) == 0 {
+		return fmt.Errorf("no overpass servers available")
+	}
+
+	totalNatural := 0
+	for _, cw := range perClientWorkers {
+		totalNatural += cw.count
+	}
 	if workers == 0 {
-		workers = client.RateLimit()
-		log.Printf("Auto-detected %d workers from API rate limit", workers)
+		workers = totalNatural
+		log.Printf("Auto-detected %d workers across %d server(s)", workers, len(perClientWorkers))
+	} else if workers != totalNatural {
+		// Reapportion the user-specified total across clients in proportion to
+		// each client's natural budget. Any remainder goes to the largest budget.
+		perClientWorkers = apportionWorkers(perClientWorkers, workers, totalNatural)
+		log.Printf("Apportioned %d workers across %d server(s)", workers, len(perClientWorkers))
 	}
 
 	f, err := os.Open(file)
@@ -547,7 +692,7 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 		baseDelay:  5 * time.Second,
 		maxDelay:   60 * time.Second,
 	}
-	processUnits := concurrentUnitsWorker(workers, unitProcessor(ctx, cacheDir, cacheTTL, client.Query, retrier[[]element](retryConf), queryTimeout), failFast)
+	processUnits := concurrentUnitsWorker(perClientWorkers, unitProcessor(ctx, cacheDir, cacheTTL, retrier[[]element](retryConf), queryTimeout), failFast)
 	results, err := processUnits(workUnits...)
 	if err != nil {
 		return err

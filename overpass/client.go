@@ -19,10 +19,11 @@ type Client struct {
 	httpClient          *http.Client
 	fetchStatus         func() (Status, error)
 
-	tokens    chan struct{}    // buffered channel, cap = rate limit
+	tokens    chan struct{}    // buffered channel, cap = rate limit; nil when unlimited
 	requests  chan slotRequest // incoming slot requests
 	done      chan struct{}    // shutdown signal
-	rateLimit int              // cached from initial status fetch
+	rateLimit int              // cached from initial status fetch; 0 means unlimited
+	unlimited bool             // true when server reports Rate limit: 0
 
 	startOnce sync.Once
 	closeOnce sync.Once
@@ -57,12 +58,20 @@ func (c *Client) Start(ctx context.Context) error {
 			return
 		}
 
-		if status.RateLimit < 1 {
+		if status.RateLimit < 0 {
 			err = fmt.Errorf("invalid rate limit from status: %d", status.RateLimit)
 			return
 		}
 
 		c.rateLimit = status.RateLimit
+		// Rate limit: 0 is the Overpass convention for "no per-IP slot enforcement".
+		// In that case we skip token allocation and the coordinator goroutine entirely.
+		if status.RateLimit == 0 {
+			c.unlimited = true
+			log.Printf("Overpass client started: unlimited (no per-IP rate limit)")
+			return
+		}
+
 		c.tokens = make(chan struct{}, status.RateLimit)
 
 		// Populate initial tokens - pending slots will be handled by coordinator
@@ -85,8 +94,14 @@ func (c *Client) Start(ctx context.Context) error {
 }
 
 // RateLimit returns the cached rate limit from the initial status fetch.
+// Returns 0 when the server reports no per-IP rate limit; check Unlimited() to disambiguate.
 func (c *Client) RateLimit() int {
 	return c.rateLimit
+}
+
+// Unlimited reports whether the server returned "Rate limit: 0" at startup.
+func (c *Client) Unlimited() bool {
+	return c.unlimited
 }
 
 // Close shuts down the client and cancels any pending requests.
@@ -97,28 +112,30 @@ func (c *Client) Close() {
 }
 
 // Query executes a query against the Overpass interpreter endpoint.
-// It blocks until an API slot is available.
+// It blocks until an API slot is available, unless the client is in unlimited mode.
 func (c *Client) Query(ctx context.Context, query string) (*http.Response, error) {
-	// Request a slot
-	result := make(chan error, 1)
-	select {
-	case c.requests <- slotRequest{ctx: ctx, result: result}:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-c.done:
-		return nil, errors.New("client closed")
-	}
-
-	// Wait for slot
-	select {
-	case err := <-result:
-		if err != nil {
-			return nil, fmt.Errorf("waiting for API slot: %w", err)
+	if !c.unlimited {
+		// Request a slot
+		result := make(chan error, 1)
+		select {
+		case c.requests <- slotRequest{ctx: ctx, result: result}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-c.done:
+			return nil, errors.New("client closed")
 		}
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-c.done:
-		return nil, errors.New("client closed")
+
+		// Wait for slot
+		select {
+		case err := <-result:
+			if err != nil {
+				return nil, fmt.Errorf("waiting for API slot: %w", err)
+			}
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-c.done:
+			return nil, errors.New("client closed")
+		}
 	}
 
 	// Make the actual request.
