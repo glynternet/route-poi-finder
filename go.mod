@@ -1,6 +1,6 @@
 module github.com/glynternet/route-poi-finder
 
-go 1.22.4
+go 1.23
 
 require (
 	github.com/tkrajina/gpxgo v1.4.0
