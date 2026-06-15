@@ -20,7 +20,7 @@ var queries = []query{{
 		},
 	}},
 }, {
-	radius: 500,
+	radius: 1000,
 	conditions: []condition{{
 		tag: "amenity",
 		values: []string{
@@ -36,7 +36,7 @@ var queries = []query{{
 		},
 	}},
 }, {
-	radius: 200,
+	radius: 1000,
 	conditions: []condition{{
 		tag: "amenity",
 		values: []string{
@@ -87,8 +87,8 @@ var queries = []query{{
 		},
 	}},
 }, {
+	radius: 1000,
 	conditions: []condition{{
-		// - - natural~"^(spring|peak)$"
 		tag: "natural",
 		values: []string{
 			"spring",
@@ -96,7 +96,7 @@ var queries = []query{{
 			"mountain_range",
 			"ridge",
 			"arete",
-			"hot_spring", // OSM tags use underscores, not spaces
+			"hot_spring",
 			"plateau",
 			"saddle",
 		},
@@ -152,7 +152,7 @@ var queries = []query{{
 		},
 	}},
 }, {
-	radius: 250,
+	radius: 500,
 	conditions: []condition{{
 		tag:    "ford",
 		exists: ExistsYes,
@@ -170,7 +170,7 @@ var queries = []query{{
 		},
 	}},
 }, {
-	radius: 200,
+	radius: 1000,
 	//- - amenity="fountain"
 	//  - drinking_water!="no"
 	//  - drinking_water~".+"
