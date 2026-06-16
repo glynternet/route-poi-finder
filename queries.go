@@ -27,9 +27,11 @@ var queries = []query{{
 			"bicycle_rental",
 			"bicycle_repair_station",
 			"bicycle_wash",
+			"community_centre",
 			"compressed_air",
 			"place_of_worship",
 			"public_bath",
+			"ranger_station",
 			"shelter",
 			"shower",
 			"toilets",
@@ -65,6 +67,18 @@ var queries = []query{{
 	conditions: []condition{{
 		tag:    "accommodation",
 		exists: ExistsYes,
+	}},
+}, {
+	radius: 1000,
+	conditions: []condition{{
+		// Staffed info points that often have water taps, toilets and info,
+		// like ranger stations. Filter to visitor_centre/office to avoid the
+		// many tiny info boards/guideposts tagged tourism=information.
+		tag: "information",
+		values: []string{
+			"office",
+			"visitor_centre",
+		},
 	}},
 }, {
 	conditions: []condition{{

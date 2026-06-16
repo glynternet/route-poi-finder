@@ -1289,6 +1289,8 @@ func resolveSymbolAndCategories(tags map[string]string) (string, []string) {
 		{tags: map[string]matchConfig{"leisure": {exact: "nature_reserve"}}, symbol: "Park"},
 		{tags: map[string]matchConfig{"amenity": {exact: "shelter"}}, symbol: "Building", category: static("Shelter")},
 		{tags: map[string]matchConfig{"amenity": {exact: "place_of_worship"}}, symbol: "Church", category: static("Place of Worship")},
+		{tags: map[string]matchConfig{"information": {exact: "visitor_centre"}}, symbol: "Information", category: static("Visitor Centre")},
+		{tags: map[string]matchConfig{"information": {exact: "office"}}, symbol: "Information", category: static("Tourist Office")},
 		{tags: map[string]matchConfig{"place": {any: []string{"town", "village", "hamlet", "city", "neighbourhood"}}}, symbol: "City Hall", category: static("Settlement")},
 		{tags: map[string]matchConfig{"natural": {exact: "spring"}}, symbol: "Water Source"},
 		{tags: map[string]matchConfig{"waterway": {any: []string{"river", "stream", "waterfall", "spring"}}}, symbol: "Water Source"},
