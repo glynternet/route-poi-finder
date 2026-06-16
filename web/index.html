@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>route-poi-finder — POI triage</title>
+
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" crossorigin="" />
+
+  <style>
+    :root {
+      --panel-w: 320px;
+      --include: #2e7d32;
+      --exclude: #c62828;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    #app { display: flex; height: 100%; }
+
+    #panel {
+      width: var(--panel-w); flex: 0 0 var(--panel-w);
+      height: 100%; overflow-y: auto;
+      padding: 14px 16px; border-right: 1px solid #ddd; background: #fafafa;
+    }
+    #map { flex: 1 1 auto; height: 100%; }
+
+    h1 { font-size: 16px; margin: 0 0 4px; }
+    .sub { color: #666; font-size: 12px; margin: 0 0 14px; }
+    section { margin-bottom: 18px; }
+    section > h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: #888; margin: 0 0 8px; }
+
+    button, label.btn {
+      display: inline-block; cursor: pointer; font-size: 13px;
+      padding: 7px 10px; border: 1px solid #bbb; border-radius: 6px;
+      background: #fff; color: #222; margin: 0 4px 6px 0;
+    }
+    button:hover, label.btn:hover { background: #f0f0f0; }
+    button:disabled { opacity: .5; cursor: default; }
+    button.primary { background: #1565c0; color: #fff; border-color: #1565c0; }
+    button.primary:hover { background: #0d47a1; }
+    input[type=file] { display: none; }
+
+    .mode-toggle { display: flex; gap: 0; margin-bottom: 8px; }
+    .mode-toggle button { flex: 1; margin: 0; border-radius: 0; }
+    .mode-toggle button:first-child { border-radius: 6px 0 0 6px; }
+    .mode-toggle button:last-child { border-radius: 0 6px 6px 0; border-left: none; }
+    .mode-toggle button.active.include { background: var(--include); color: #fff; border-color: var(--include); }
+    .mode-toggle button.active.exclude { background: var(--exclude); color: #fff; border-color: var(--exclude); }
+
+    .hint { font-size: 12px; color: #666; line-height: 1.4; }
+
+    .counts { display: flex; gap: 10px; font-variant-numeric: tabular-nums; }
+    .counts .box { flex: 1; background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 8px; text-align: center; }
+    .counts .n { font-size: 20px; font-weight: 600; display: block; }
+    .counts .lbl { font-size: 10px; text-transform: uppercase; color: #888; letter-spacing: .04em; }
+    .counts .kept .n { color: var(--include); }
+    .counts .removed .n { color: var(--exclude); }
+
+    ul#area-list { list-style: none; margin: 0; padding: 0; }
+    ul#area-list li {
+      display: flex; align-items: center; justify-content: space-between;
+      font-size: 13px; padding: 6px 8px; border: 1px solid #e0e0e0; border-radius: 6px; margin-bottom: 6px; background: #fff;
+    }
+    ul#area-list .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }
+    ul#area-list .del { border: none; background: none; color: #c62828; font-size: 16px; line-height: 1; padding: 0 4px; margin: 0; }
+
+    label.check { font-size: 13px; display: flex; align-items: center; gap: 6px; cursor: pointer; }
+
+    #status { font-size: 12px; color: #555; min-height: 1.2em; }
+
+    #legend { font-size: 12px; columns: 2; }
+    #legend .row { break-inside: avoid; display: flex; align-items: center; gap: 6px; margin-bottom: 3px; }
+    #legend .dot { width: 10px; height: 10px; border-radius: 50%; flex: 0 0 10px; }
+
+    #drop-overlay {
+      position: fixed; inset: 0; background: rgba(21,101,192,.12);
+      border: 4px dashed #1565c0; display: none; align-items: center; justify-content: center;
+      font-size: 22px; color: #1565c0; z-index: 9999; pointer-events: none;
+    }
+    #drop-overlay.show { display: flex; }
+
+    .leaflet-popup-content { font-size: 13px; }
+    .poi-pop b { font-size: 14px; }
+    .poi-pop table { border-collapse: collapse; margin-top: 6px; }
+    .poi-pop td { padding: 1px 6px 1px 0; vertical-align: top; }
+    .poi-pop td.k { color: #888; white-space: nowrap; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="panel">
+      <h1>POI triage</h1>
+      <p class="sub">Load route-poi-finder output, prune it, export the same JSON.</p>
+
+      <section>
+        <h2>Load</h2>
+        <label class="btn" for="poi-input">Load POI JSON</label>
+        <input type="file" id="poi-input" accept=".json,application/json" />
+        <label class="btn" for="gpx-input">Load route GPX</label>
+        <input type="file" id="gpx-input" accept=".gpx,application/gpx+xml,application/xml,text/xml" />
+        <div id="status">Drag &amp; drop a POI <code>.json</code> (or route <code>.gpx</code>) anywhere.</div>
+      </section>
+
+      <section>
+        <h2>Counts</h2>
+        <div class="counts">
+          <div class="box"><span class="n" id="c-total">0</span><span class="lbl">total</span></div>
+          <div class="box kept"><span class="n" id="c-kept">0</span><span class="lbl">kept</span></div>
+          <div class="box removed"><span class="n" id="c-removed">0</span><span class="lbl">removed</span></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Draw mode</h2>
+        <div class="mode-toggle" id="mode-toggle">
+          <button data-mode="exclude" class="exclude active">Exclude</button>
+          <button data-mode="include" class="include">Include</button>
+        </div>
+        <p class="hint">Use the rectangle/polygon tools on the map. New shapes use the
+          selected mode. <b>Exclude</b> drops POIs inside it. If any <b>Include</b>
+          area exists, only POIs inside an include area are kept (minus excludes).</p>
+        <label class="check"><input type="checkbox" id="show-removed" /> Show removed POIs (faded)</label>
+      </section>
+
+      <section>
+        <h2>Areas</h2>
+        <ul id="area-list"></ul>
+        <p class="hint" id="no-areas">No areas drawn yet.</p>
+      </section>
+
+      <section>
+        <h2>Export</h2>
+        <button class="primary" id="export-btn" disabled>Download filtered JSON</button>
+      </section>
+
+      <section>
+        <h2>Legend</h2>
+        <div id="legend"></div>
+      </section>
+    </div>
+    <div id="map"></div>
+  </div>
+
+  <div id="drop-overlay">Drop POI JSON or route GPX</div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js" crossorigin=""></script>
+  <script>
+  "use strict";
+
+  // ---------- Symbol colour palette ----------
+  const SYMBOL_COLORS = {
+    "Drinking Water": "#1f78b4",
+    "Water Source": "#6baed6",
+    "Restaurant": "#e31a1c",
+    "Fast Food": "#ff7f00",
+    "Pizza": "#fb9a99",
+    "Bar": "#b15928",
+    "Shopping Center": "#33a02c",
+    "Gas Station": "#6a3d9a",
+    "Campground": "#117733",
+    "Building": "#377eb8",
+    "Park": "#4daf4a",
+    "Restroom": "#984ea3",
+    "Summit": "#8c510a",
+    "Scenic Area": "#d95f02",
+    "Church": "#777777",
+    "City Hall": "#543005",
+    "Picnic Area": "#a6d854",
+    "Mine": "#555555",
+  };
+
+  function hashHue(str) {
+    let h = 0;
+    for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) | 0;
+    return ((h % 360) + 360) % 360;
+  }
+  function colorForSymbol(sym) {
+    if (!sym) return "#888888";
+    if (SYMBOL_COLORS[sym]) return SYMBOL_COLORS[sym];
+    return `hsl(${hashHue(sym)}, 65%, 45%)`;
+  }
+
+  // ---------- Map ----------
+  const map = L.map("map", { preferCanvas: true }).setView([46.8, 8.2], 6);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: "&copy; OpenStreetMap contributors",
+  }).addTo(map);
+
+  // Dedicated pane so the route line sits beneath POI markers.
+  map.createPane("routePane");
+  map.getPane("routePane").style.zIndex = 350;
+
+  // Drawn include/exclude areas render here: above the route line but BELOW the
+  // POI markers (overlayPane = 400), for clean visual layering.
+  //
+  // Crucially the areas use an SVG renderer, not canvas. A canvas renderer is a
+  // single viewport-sized element with pointer-events:auto (it does its own hit
+  // testing), so once a shape's canvas is on top it swallows EVERY click across
+  // the whole map and no marker is clickable. Leaflet's SVG overlay instead has
+  // pointer-events:none except on painted interactive paths; combined with
+  // interactive:false on the shapes (see drawControl below), the areas capture
+  // no clicks at all and every click falls through to the POI markers.
+  map.createPane("areaPane");
+  map.getPane("areaPane").style.zIndex = 360;
+  const areaRenderer = L.svg({ pane: "areaPane" });
+
+  const markerRenderer = L.canvas({ padding: 0.5 });
+
+  // ---------- State ----------
+  let pois = [];            // parsed Point[] from the loaded JSON
+  let markers = [];         // L.circleMarker[], parallel to pois
+  let routeLayer = null;    // L.polyline of the loaded GPX, if any
+  let drawMode = "exclude"; // current mode for newly drawn shapes
+  let areaSeq = 0;          // id counter for drawn areas
+  const areas = [];         // { id, layer, mode, ring:[{lat,lng}], bbox }
+
+  const drawnItems = new L.FeatureGroup().addTo(map);
+
+  // ---------- Geometry ----------
+  function ringFromLayer(layer) {
+    // Rectangle and polygon both expose getLatLngs() => [ ring ].
+    const latlngs = layer.getLatLngs();
+    const ring = Array.isArray(latlngs[0]) ? latlngs[0] : latlngs;
+    return ring.map((p) => ({ lat: p.lat, lng: p.lng }));
+  }
+  function bboxOf(ring) {
+    let minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity;
+    for (const p of ring) {
+      if (p.lat < minLat) minLat = p.lat;
+      if (p.lat > maxLat) maxLat = p.lat;
+      if (p.lng < minLng) minLng = p.lng;
+      if (p.lng > maxLng) maxLng = p.lng;
+    }
+    return { minLat, maxLat, minLng, maxLng };
+  }
+  function pointInRing(lat, lon, ring) {
+    let inside = false;
+    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      const yi = ring[i].lat, xi = ring[i].lng;
+      const yj = ring[j].lat, xj = ring[j].lng;
+      const intersect = ((yi > lat) !== (yj > lat)) &&
+        (lon < ((xj - xi) * (lat - yi)) / (yj - yi) + xi);
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  }
+  function areaContains(area, lat, lon) {
+    const b = area.bbox;
+    if (lat < b.minLat || lat > b.maxLat || lon < b.minLng || lon > b.maxLng) return false;
+    return pointInRing(lat, lon, area.ring);
+  }
+
+  // ---------- Filtering ----------
+  function isKept(p) {
+    let excluded = false, includedHit = false;
+    let hasInclude = false;
+    for (const a of areas) {
+      if (a.mode === "include") hasInclude = true;
+    }
+    for (const a of areas) {
+      if (areaContains(a, p.lat, p.lon)) {
+        if (a.mode === "exclude") { excluded = true; break; }
+        if (a.mode === "include") includedHit = true;
+      }
+    }
+    if (excluded) return false;
+    if (hasInclude) return includedHit;
+    return true;
+  }
+
+  function applyFilter() {
+    const showRemoved = document.getElementById("show-removed").checked;
+    let kept = 0;
+    for (let i = 0; i < pois.length; i++) {
+      const k = isKept(pois[i]);
+      pois[i]._kept = k;
+      const m = markers[i];
+      if (!m) continue;
+      if (k) {
+        m.setStyle({ opacity: 1, fillOpacity: 0.85 });
+        kept++;
+      } else if (showRemoved) {
+        m.setStyle({ opacity: 0.25, fillOpacity: 0.12 });
+      } else {
+        m.setStyle({ opacity: 0, fillOpacity: 0 });
+      }
+    }
+    document.getElementById("c-total").textContent = pois.length;
+    document.getElementById("c-kept").textContent = kept;
+    document.getElementById("c-removed").textContent = pois.length - kept;
+    document.getElementById("export-btn").disabled = pois.length === 0;
+  }
+
+  // ---------- POI rendering ----------
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => (
+      { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+    ));
+  }
+  function popupHtml(p) {
+    let rows = "";
+    if (p.desc) {
+      try {
+        const tags = JSON.parse(p.desc);
+        for (const k of Object.keys(tags).sort()) {
+          rows += `<tr><td class="k">${escapeHtml(k)}</td><td>${escapeHtml(tags[k])}</td></tr>`;
+        }
+      } catch (e) {
+        rows = `<tr><td colspan="2">${escapeHtml(p.desc)}</td></tr>`;
+      }
+    }
+    const cats = (p.categories && p.categories.length) ? escapeHtml(p.categories.join(", ")) : "—";
+    return `<div class="poi-pop">
+      <b>${escapeHtml(p.name || "(unnamed)")}</b><br>
+      <span style="color:#666">sym:</span> ${escapeHtml(p.sym || "—")}
+      &nbsp; <span style="color:#666">cat:</span> ${cats}
+      <table>${rows}</table>
+    </div>`;
+  }
+
+  function clearPois() {
+    for (const m of markers) map.removeLayer(m);
+    markers = [];
+    pois = [];
+  }
+
+  function renderPois(data) {
+    clearPois();
+    pois = data;
+    const pts = [];
+    for (let i = 0; i < pois.length; i++) {
+      const p = pois[i];
+      if (typeof p.lat !== "number" || typeof p.lon !== "number") { markers.push(null); continue; }
+      const m = L.circleMarker([p.lat, p.lon], {
+        renderer: markerRenderer,
+        radius: 6,
+        color: "#333",
+        weight: 1,
+        fillColor: colorForSymbol(p.sym),
+        fillOpacity: 0.85,
+      });
+      m.bindPopup(() => popupHtml(p), { maxWidth: 320 });
+      m.addTo(map);
+      markers.push(m);
+      pts.push([p.lat, p.lon]);
+    }
+    if (pts.length) map.fitBounds(L.latLngBounds(pts).pad(0.05));
+    buildLegend();
+    applyFilter();
+  }
+
+  function buildLegend() {
+    const seen = new Map();
+    for (const p of pois) {
+      const s = p.sym || "(none)";
+      seen.set(s, (seen.get(s) || 0) + 1);
+    }
+    const el = document.getElementById("legend");
+    el.innerHTML = "";
+    [...seen.entries()].sort((a, b) => b[1] - a[1]).forEach(([sym, n]) => {
+      const row = document.createElement("div");
+      row.className = "row";
+      row.innerHTML = `<span class="dot" style="background:${colorForSymbol(sym === "(none)" ? "" : sym)}"></span>` +
+        `<span>${escapeHtml(sym)} (${n})</span>`;
+      el.appendChild(row);
+    });
+  }
+
+  // ---------- GPX route ----------
+  function renderGpx(xmlText) {
+    const doc = new DOMParser().parseFromString(xmlText, "application/xml");
+    if (doc.getElementsByTagName("parsererror").length) throw new Error("invalid GPX XML");
+    const pts = [];
+    const trkpts = doc.getElementsByTagName("trkpt");
+    for (const node of trkpts) {
+      const lat = parseFloat(node.getAttribute("lat"));
+      const lon = parseFloat(node.getAttribute("lon"));
+      if (!Number.isNaN(lat) && !Number.isNaN(lon)) pts.push([lat, lon]);
+    }
+    if (!pts.length) throw new Error("no <trkpt> points found in GPX");
+    if (routeLayer) map.removeLayer(routeLayer);
+    routeLayer = L.polyline(pts, { pane: "routePane", color: "#1565c0", weight: 3, opacity: 0.75 }).addTo(map);
+    if (!pois.length) map.fitBounds(routeLayer.getBounds().pad(0.05));
+    return pts.length;
+  }
+
+  // ---------- Drawing controls ----------
+  function styleForMode(mode) {
+    const c = mode === "include" ? getComputedStyle(document.documentElement).getPropertyValue("--include").trim()
+                                 : getComputedStyle(document.documentElement).getPropertyValue("--exclude").trim();
+    return { color: c, weight: 2, fillColor: c, fillOpacity: 0.1 };
+  }
+
+  const drawControl = new L.Control.Draw({
+    edit: { featureGroup: drawnItems, remove: true },
+    draw: {
+      // interactive:false => the shape's SVG path gets pointer-events:none, so it
+      // never intercepts clicks meant for the POI markers underneath. Areas are
+      // managed via the Areas list (delete) and the draw toolbar (edit handles
+      // live in their own pane and work regardless of the path being passive).
+      polygon: { allowIntersection: false, showArea: false, shapeOptions: { renderer: areaRenderer, interactive: false } },
+      rectangle: { shapeOptions: { renderer: areaRenderer, interactive: false } },
+      polyline: false, circle: false, marker: false, circlemarker: false,
+    },
+  });
+  map.addControl(drawControl);
+
+  function registerArea(layer, mode) {
+    const ring = ringFromLayer(layer);
+    const area = { id: ++areaSeq, layer, mode, ring, bbox: bboxOf(ring) };
+    layer.setStyle(styleForMode(mode));
+    areas.push(area);
+    return area;
+  }
+  function updateAreaGeometry(area) {
+    area.ring = ringFromLayer(area.layer);
+    area.bbox = bboxOf(area.ring);
+  }
+  function removeArea(area) {
+    drawnItems.removeLayer(area.layer);
+    const idx = areas.indexOf(area);
+    if (idx >= 0) areas.splice(idx, 1);
+  }
+
+  map.on(L.Draw.Event.CREATED, (e) => {
+    drawnItems.addLayer(e.layer);
+    registerArea(e.layer, drawMode);
+    refreshAreaList();
+    applyFilter();
+  });
+  map.on(L.Draw.Event.EDITED, (e) => {
+    e.layers.eachLayer((layer) => {
+      const area = areas.find((a) => a.layer === layer);
+      if (area) updateAreaGeometry(area);
+    });
+    applyFilter();
+  });
+  map.on(L.Draw.Event.DELETED, (e) => {
+    e.layers.eachLayer((layer) => {
+      const area = areas.find((a) => a.layer === layer);
+      if (area) {
+        const idx = areas.indexOf(area);
+        if (idx >= 0) areas.splice(idx, 1);
+      }
+    });
+    refreshAreaList();
+    applyFilter();
+  });
+
+  function refreshAreaList() {
+    const list = document.getElementById("area-list");
+    const none = document.getElementById("no-areas");
+    list.innerHTML = "";
+    none.style.display = areas.length ? "none" : "block";
+    for (const area of areas) {
+      const li = document.createElement("li");
+      const color = area.mode === "include" ? "var(--include)" : "var(--exclude)";
+      const label = area.mode === "include" ? "Include" : "Exclude";
+      li.innerHTML = `<span><span class="swatch" style="background:${color}"></span>${label} #${area.id}</span>`;
+      const del = document.createElement("button");
+      del.className = "del";
+      del.title = "Delete area";
+      del.textContent = "✕";
+      del.addEventListener("click", () => {
+        removeArea(area);
+        refreshAreaList();
+        applyFilter();
+      });
+      li.appendChild(del);
+      list.appendChild(li);
+    }
+  }
+
+  // ---------- Mode toggle ----------
+  document.getElementById("mode-toggle").addEventListener("click", (e) => {
+    const btn = e.target.closest("button");
+    if (!btn) return;
+    drawMode = btn.dataset.mode;
+    document.querySelectorAll("#mode-toggle button").forEach((b) => b.classList.toggle("active", b === btn));
+  });
+
+  document.getElementById("show-removed").addEventListener("change", applyFilter);
+
+  // ---------- Export ----------
+  function exportJson() {
+    const out = [];
+    for (let i = 0; i < pois.length; i++) {
+      if (!pois[i]._kept) continue;
+      const p = pois[i];
+      out.push({
+        name: p.name,
+        lat: p.lat,
+        lon: p.lon,
+        desc: p.desc,
+        sym: p.sym,
+        categories: p.categories,
+        osmid: p.osmid,
+      });
+    }
+    const blob = new Blob([JSON.stringify(out, null, 2) + "\n"], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "pois-filtered.json";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(a.href);
+  }
+  document.getElementById("export-btn").addEventListener("click", exportJson);
+
+  // ---------- File loading ----------
+  function setStatus(msg, isError) {
+    const el = document.getElementById("status");
+    el.textContent = msg;
+    el.style.color = isError ? "#c62828" : "#555";
+  }
+  function looksLikeGpx(name, text) {
+    if (/\.gpx$/i.test(name)) return true;
+    if (/\.json$/i.test(name)) return false;
+    return /^\s*</.test(text) || text.includes("<gpx");
+  }
+  function handleText(name, text) {
+    try {
+      if (looksLikeGpx(name, text)) {
+        const n = renderGpx(text);
+        setStatus(`Route loaded: ${n} points${name ? " (" + name + ")" : ""}.`);
+      } else {
+        const data = JSON.parse(text);
+        if (!Array.isArray(data)) throw new Error("expected a JSON array of POIs");
+        renderPois(data);
+        setStatus(`Loaded ${data.length} POIs${name ? " from " + name : ""}.`);
+      }
+    } catch (err) {
+      setStatus("Failed to load: " + err.message, true);
+    }
+  }
+  function readFile(file) {
+    const reader = new FileReader();
+    reader.onload = () => handleText(file.name || "", String(reader.result));
+    reader.onerror = () => setStatus("Could not read file.", true);
+    reader.readAsText(file);
+  }
+
+  document.getElementById("poi-input").addEventListener("change", (e) => {
+    if (e.target.files[0]) readFile(e.target.files[0]);
+    e.target.value = "";
+  });
+  document.getElementById("gpx-input").addEventListener("change", (e) => {
+    if (e.target.files[0]) readFile(e.target.files[0]);
+    e.target.value = "";
+  });
+
+  // Drag & drop anywhere.
+  const overlay = document.getElementById("drop-overlay");
+  let dragDepth = 0;
+  window.addEventListener("dragenter", (e) => { e.preventDefault(); dragDepth++; overlay.classList.add("show"); });
+  window.addEventListener("dragover", (e) => { e.preventDefault(); });
+  window.addEventListener("dragleave", (e) => { e.preventDefault(); if (--dragDepth <= 0) { dragDepth = 0; overlay.classList.remove("show"); } });
+  window.addEventListener("drop", (e) => {
+    e.preventDefault();
+    dragDepth = 0; overlay.classList.remove("show");
+    for (const file of e.dataTransfer.files) readFile(file);
+  });
+  </script>
+</body>
+</html>
