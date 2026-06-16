@@ -119,6 +119,8 @@
         <label class="btn" for="gpx-input">Load route GPX</label>
         <input type="file" id="gpx-input" accept=".gpx,application/gpx+xml,application/xml,text/xml" />
         <div id="status">Drag &amp; drop a POI <code>.json</code> (or route <code>.gpx</code>) anywhere.</div>
+        <p class="hint">Your session is saved in this browser and restored on refresh.</p>
+        <button id="clear-session-btn">Clear saved session</button>
       </section>
 
       <section>
@@ -266,6 +268,7 @@
   let pois = [];            // parsed Point[] from the loaded JSON
   let markers = [];         // L.circleMarker[], parallel to pois
   let routeLayer = null;    // L.polyline of the loaded GPX, if any
+  let routePts = [];        // [lat,lon][] of the loaded GPX, for persistence
   let drawMode = "exclude"; // current mode for newly drawn shapes
   let areaSeq = 0;          // id counter for drawn areas
   const areas = [];         // { id, layer, mode, ring:[{lat,lng}], bbox }
@@ -400,6 +403,7 @@
     document.getElementById("c-kept").textContent = kept;
     document.getElementById("c-removed").textContent = pois.length - kept;
     document.getElementById("export-btn").disabled = pois.length === 0;
+    saveState();
   }
 
   // ---------- POI rendering ----------
@@ -634,8 +638,10 @@
     }
     if (!pts.length) throw new Error("no <trkpt> points found in GPX");
     if (routeLayer) map.removeLayer(routeLayer);
+    routePts = pts;
     routeLayer = L.polyline(pts, { pane: "routePane", color: "#1565c0", weight: 3, opacity: 0.75 }).addTo(map);
     if (!pois.length) map.fitBounds(routeLayer.getBounds().pad(0.05));
+    saveState();
     return pts.length;
   }
 
@@ -732,6 +738,7 @@
     if (!btn) return;
     drawMode = btn.dataset.mode;
     document.querySelectorAll("#mode-toggle button").forEach((b) => b.classList.toggle("active", b === btn));
+    saveState();
   });
 
   document.getElementById("show-removed").addEventListener("change", applyFilter);
@@ -742,6 +749,7 @@
     if (!btn) return;
     tagMode = btn.dataset.mode;
     document.querySelectorAll("#tag-mode-toggle button").forEach((b) => b.classList.toggle("active", b === btn));
+    saveState();
   });
   document.getElementById("tag-key").addEventListener("change", populateTagValueSelect);
   document.getElementById("tag-add-btn").addEventListener("click", addTagRule);
@@ -773,6 +781,112 @@
     URL.revokeObjectURL(a.href);
   }
   document.getElementById("export-btn").addEventListener("click", exportJson);
+
+  // ---------- Persistence ----------
+  // The whole session (POIs, route, drawn areas, tag filters, modes) is mirrored
+  // into localStorage so a page refresh restores exactly where you left off.
+  const STORAGE_KEY = "route-poi-triage-state-v1";
+  let saveTimer = null;   // debounce handle
+  let restoring = false;  // suppress saves while restoreState() rebuilds state
+
+  function setToggleActive(containerId, mode) {
+    document.querySelectorAll(`#${containerId} button`)
+      .forEach((b) => b.classList.toggle("active", b.dataset.mode === mode));
+  }
+
+  // Strip derived/cache fields (_tags, _kept) so stored POIs stay small and fresh.
+  function cleanPoi(p) {
+    const c = {};
+    for (const k in p) if (!k.startsWith("_")) c[k] = p[k];
+    return c;
+  }
+
+  function snapshotState() {
+    return {
+      pois: pois.map(cleanPoi),
+      routePts,
+      // Areas are stored as plain rings; their Leaflet layers are rebuilt on load.
+      areas: areas.map((a) => ({ id: a.id, mode: a.mode, ring: a.ring })),
+      areaSeq,
+      tagRules: tagRules.map((r) => ({ id: r.id, mode: r.mode, key: r.key, value: r.value })),
+      tagRuleSeq,
+      drawMode,
+      tagMode,
+      showRemoved: document.getElementById("show-removed").checked,
+    };
+  }
+
+  function saveState() {
+    if (restoring) return;
+    // POI arrays can be large, so coalesce rapid changes into one write.
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshotState()));
+      } catch (e) {
+        // QuotaExceededError, or storage blocked (private mode): keep working,
+        // we just can't persist this session.
+        setStatus("Couldn't save session (storage full or disabled): " + e.message, true);
+      }
+    }, 400);
+  }
+
+  function restoreState() {
+    let raw;
+    try {
+      raw = localStorage.getItem(STORAGE_KEY);
+    } catch (e) {
+      return false; // storage disabled, e.g. private browsing
+    }
+    if (!raw) return false;
+    let s;
+    try { s = JSON.parse(raw); } catch (e) { return false; } // corrupt: ignore
+
+    restoring = true;
+    try {
+      if (Array.isArray(s.routePts) && s.routePts.length) {
+        routePts = s.routePts;
+        routeLayer = L.polyline(routePts, { pane: "routePane", color: "#1565c0", weight: 3, opacity: 0.75 }).addTo(map);
+      }
+      if (Array.isArray(s.pois) && s.pois.length) {
+        renderPois(s.pois); // rebuilds markers, legend, tag index and selects
+      }
+      // Areas are rebuilt as polygons regardless of their original shape; this is
+      // functionally identical for filtering and still editable via the toolbar.
+      if (Array.isArray(s.areas)) {
+        for (const a of s.areas) {
+          const layer = L.polygon(a.ring.map((p) => [p.lat, p.lng]),
+            { renderer: areaRenderer, interactive: false });
+          drawnItems.addLayer(layer);
+          layer.setStyle(styleForMode(a.mode));
+          areas.push({ id: a.id, layer, mode: a.mode, ring: a.ring, bbox: bboxOf(a.ring) });
+        }
+        areaSeq = s.areaSeq || areas.reduce((m, a) => Math.max(m, a.id), 0);
+        refreshAreaList();
+      }
+      if (Array.isArray(s.tagRules)) {
+        for (const r of s.tagRules) tagRules.push({ id: r.id, mode: r.mode, key: r.key, value: r.value });
+        tagRuleSeq = s.tagRuleSeq || tagRules.reduce((m, r) => Math.max(m, r.id), 0);
+        refreshTagRuleList();
+      }
+      if (s.drawMode) { drawMode = s.drawMode; setToggleActive("mode-toggle", drawMode); }
+      if (s.tagMode) { tagMode = s.tagMode; setToggleActive("tag-mode-toggle", tagMode); }
+      if (s.showRemoved) document.getElementById("show-removed").checked = true;
+    } finally {
+      restoring = false;
+    }
+    applyFilter();
+    return true;
+  }
+
+  function clearSession() {
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+    } catch (e) { /* storage disabled: nothing persisted anyway */ }
+    location.reload(); // simplest clean slate
+  }
+  document.getElementById("clear-session-btn").addEventListener("click", clearSession);
 
   // ---------- File loading ----------
   function setStatus(msg, isError) {
@@ -827,6 +941,9 @@
     dragDepth = 0; overlay.classList.remove("show");
     for (const file of e.dataTransfer.files) readFile(file);
   });
+
+  // Restore the previous session, if any, once everything above is wired up.
+  if (restoreState()) setStatus("Restored previous session from this browser.");
   </script>
 </body>
 </html>
