@@ -58,13 +58,31 @@
     .counts .kept .n { color: var(--include); }
     .counts .removed .n { color: var(--exclude); }
 
-    ul#area-list { list-style: none; margin: 0; padding: 0; }
-    ul#area-list li {
-      display: flex; align-items: center; justify-content: space-between;
+    ul#area-list, ul#tag-rule-list { list-style: none; margin: 0; padding: 0; }
+    ul#area-list li, ul#tag-rule-list li {
+      display: flex; align-items: center; justify-content: space-between; gap: 6px;
       font-size: 13px; padding: 6px 8px; border: 1px solid #e0e0e0; border-radius: 6px; margin-bottom: 6px; background: #fff;
     }
     ul#area-list .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }
-    ul#area-list .del { border: none; background: none; color: #c62828; font-size: 16px; line-height: 1; padding: 0 4px; margin: 0; }
+    ul#area-list .del, ul#tag-rule-list .del { border: none; background: none; color: #c62828; font-size: 16px; line-height: 1; padding: 0 4px; margin: 0; }
+
+    /* Tag filter controls */
+    .tag-add { display: flex; gap: 4px; margin-bottom: 8px; }
+    .tag-add select {
+      flex: 1 1 auto; min-width: 0; font-size: 13px; padding: 6px;
+      border: 1px solid #bbb; border-radius: 6px; background: #fff; color: #222;
+    }
+    .tag-add select:disabled { opacity: .5; }
+    .tag-add button { margin: 0; flex: 0 0 auto; }
+    ul#tag-rule-list .rule-main { display: flex; align-items: center; gap: 6px; min-width: 0; }
+    ul#tag-rule-list .rule-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    ul#tag-rule-list .rule-text code { font-size: 12px; }
+    ul#tag-rule-list .rule-right { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+    ul#tag-rule-list .count { color: #888; font-variant-numeric: tabular-nums; font-size: 12px; }
+    .mode-chip {
+      cursor: pointer; font-size: 10px; text-transform: uppercase; letter-spacing: .04em;
+      padding: 2px 6px; border-radius: 4px; color: #fff; border: none; margin: 0; flex: 0 0 auto;
+    }
 
     label.check { font-size: 13px; display: flex; align-items: center; gap: 6px; cursor: pointer; }
 
@@ -128,6 +146,24 @@
         <h2>Areas</h2>
         <ul id="area-list"></ul>
         <p class="hint" id="no-areas">No areas drawn yet.</p>
+      </section>
+
+      <section>
+        <h2>Tag filters</h2>
+        <div class="mode-toggle" id="tag-mode-toggle">
+          <button data-mode="exclude" class="exclude active">Exclude</button>
+          <button data-mode="include" class="include">Include</button>
+        </div>
+        <div class="tag-add">
+          <select id="tag-key" disabled><option value="">tag key…</option></select>
+          <select id="tag-value" disabled><option value="">(any value)</option></select>
+          <button id="tag-add-btn" disabled>Add</button>
+        </div>
+        <ul id="tag-rule-list"></ul>
+        <p class="hint" id="no-tag-rules">No tag filters. Load POIs to choose tags.</p>
+        <p class="hint"><b>Exclude</b> drops POIs whose tags match. If any <b>Include</b>
+          filter exists, only POIs matching an include filter are kept. Tag filters apply
+          on top of (AND with) the area filters. Click a filter's chip to flip its mode.</p>
       </section>
 
       <section>
@@ -219,6 +255,11 @@
   let areaSeq = 0;          // id counter for drawn areas
   const areas = [];         // { id, layer, mode, ring:[{lat,lng}], bbox }
 
+  let tagMode = "exclude";  // current mode for newly added tag filters
+  let tagRuleSeq = 0;       // id counter for tag filters
+  const tagRules = [];      // { id, mode, key, value }  (value === null => any value)
+  let tagIndex = new Map(); // key -> Map(value -> count) over the loaded POIs
+
   const drawnItems = new L.FeatureGroup().addTo(map);
 
   // ---------- Geometry ----------
@@ -255,8 +296,28 @@
     return pointInRing(lat, lon, area.ring);
   }
 
+  // ---------- Tags ----------
+  // tagsOf returns a POI's OSM tags as a plain object, preferring the structured
+  // `tags` field and falling back to parsing the JSON embedded in `desc` for
+  // older output files that predate the tags field. The result is cached on the
+  // POI so repeated filtering does not re-parse.
+  function tagsOf(p) {
+    if (p._tags) return p._tags;
+    let t = null;
+    if (p.tags && typeof p.tags === "object") {
+      t = p.tags;
+    } else if (p.desc) {
+      try {
+        const parsed = JSON.parse(p.desc);
+        if (parsed && typeof parsed === "object") t = parsed;
+      } catch (e) { /* desc is not JSON-encoded tags; treat as having none */ }
+    }
+    p._tags = t || {};
+    return p._tags;
+  }
+
   // ---------- Filtering ----------
-  function isKept(p) {
+  function passesAreaFilter(p) {
     let excluded = false, includedHit = false;
     let hasInclude = false;
     for (const a of areas) {
@@ -271,6 +332,36 @@
     if (excluded) return false;
     if (hasInclude) return includedHit;
     return true;
+  }
+
+  // matchTagRule reports whether a POI's tags satisfy a single rule. A rule with
+  // value === null matches whenever the key is present; otherwise the value must
+  // match exactly (compared as strings).
+  function matchTagRule(p, rule) {
+    const tags = tagsOf(p);
+    if (!(rule.key in tags)) return false;
+    if (rule.value === null) return true;
+    return String(tags[rule.key]) === rule.value;
+  }
+
+  function passesTagFilter(p) {
+    let hasInclude = false, includedHit = false;
+    for (const r of tagRules) {
+      if (r.mode === "include") hasInclude = true;
+    }
+    for (const r of tagRules) {
+      if (matchTagRule(p, r)) {
+        if (r.mode === "exclude") return false; // exclude wins, mirrors area logic
+        if (r.mode === "include") includedHit = true;
+      }
+    }
+    if (hasInclude) return includedHit;
+    return true;
+  }
+
+  // A POI is kept only if it survives both filter dimensions independently.
+  function isKept(p) {
+    return passesAreaFilter(p) && passesTagFilter(p);
   }
 
   function applyFilter() {
@@ -304,15 +395,14 @@
   }
   function popupHtml(p) {
     let rows = "";
-    if (p.desc) {
-      try {
-        const tags = JSON.parse(p.desc);
-        for (const k of Object.keys(tags).sort()) {
-          rows += `<tr><td class="k">${escapeHtml(k)}</td><td>${escapeHtml(tags[k])}</td></tr>`;
-        }
-      } catch (e) {
-        rows = `<tr><td colspan="2">${escapeHtml(p.desc)}</td></tr>`;
+    const tags = tagsOf(p);
+    const keys = Object.keys(tags).sort();
+    if (keys.length) {
+      for (const k of keys) {
+        rows += `<tr><td class="k">${escapeHtml(k)}</td><td>${escapeHtml(tags[k])}</td></tr>`;
       }
+    } else if (p.desc) {
+      rows = `<tr><td colspan="2">${escapeHtml(p.desc)}</td></tr>`;
     }
     const cats = (p.categories && p.categories.length) ? escapeHtml(p.categories.join(", ")) : "—";
     return `<div class="poi-pop">
@@ -351,6 +441,9 @@
     }
     if (pts.length) map.fitBounds(L.latLngBounds(pts).pad(0.05));
     buildLegend();
+    buildTagIndex();
+    populateTagKeySelect();
+    refreshTagRuleList();
     applyFilter();
   }
 
@@ -369,6 +462,148 @@
         `<span>${escapeHtml(sym)} (${n})</span>`;
       el.appendChild(row);
     });
+  }
+
+  // ---------- Tag filter controls ----------
+  // The "any value" option must be distinguishable from a real (if rare) empty
+  // tag value, so it is always option index 0 of the value <select>.
+  function buildTagIndex() {
+    tagIndex = new Map();
+    for (const p of pois) {
+      const tags = tagsOf(p);
+      for (const k of Object.keys(tags)) {
+        let vmap = tagIndex.get(k);
+        if (!vmap) { vmap = new Map(); tagIndex.set(k, vmap); }
+        const v = String(tags[k]);
+        vmap.set(v, (vmap.get(v) || 0) + 1);
+      }
+    }
+  }
+  function keyCount(vmap) {
+    let n = 0;
+    for (const c of vmap.values()) n += c;
+    return n;
+  }
+  // Most-common first, ties broken alphabetically, for both keys and values.
+  function byCountThenName(a, b) {
+    if (b[1] !== a[1]) return b[1] - a[1];
+    return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0;
+  }
+  function populateTagKeySelect() {
+    const sel = document.getElementById("tag-key");
+    const prev = sel.value;
+    sel.innerHTML = '<option value="">tag key…</option>';
+    const entries = [...tagIndex.entries()]
+      .map(([k, vmap]) => [k, keyCount(vmap)])
+      .sort(byCountThenName);
+    for (const [k, n] of entries) {
+      const opt = document.createElement("option");
+      opt.value = k;
+      opt.textContent = `${k} (${n})`;
+      sel.appendChild(opt);
+    }
+    sel.disabled = tagIndex.size === 0;
+    if (prev && tagIndex.has(prev)) sel.value = prev;
+    populateTagValueSelect();
+  }
+  function populateTagValueSelect() {
+    const valSel = document.getElementById("tag-value");
+    const key = document.getElementById("tag-key").value;
+    valSel.innerHTML = '<option value="">(any value)</option>';
+    const vmap = key ? tagIndex.get(key) : null;
+    if (!vmap) {
+      valSel.disabled = true;
+      updateTagAddState();
+      return;
+    }
+    for (const [v, c] of [...vmap.entries()].sort(byCountThenName)) {
+      const opt = document.createElement("option");
+      opt.value = v;
+      opt.textContent = `${v === "" ? "(empty)" : v} (${c})`;
+      valSel.appendChild(opt);
+    }
+    valSel.disabled = false;
+    updateTagAddState();
+  }
+  // null => the "(any value)" option (always index 0) is selected.
+  function selectedTagValue() {
+    const valSel = document.getElementById("tag-value");
+    if (valSel.disabled || valSel.selectedIndex <= 0) return null;
+    return valSel.value;
+  }
+  function updateTagAddState() {
+    document.getElementById("tag-add-btn").disabled = !document.getElementById("tag-key").value;
+  }
+  function addTagRule() {
+    const key = document.getElementById("tag-key").value;
+    if (!key) return;
+    const value = selectedTagValue();
+    if (tagRules.some((r) => r.mode === tagMode && r.key === key && r.value === value)) return;
+    tagRules.push({ id: ++tagRuleSeq, mode: tagMode, key, value });
+    refreshTagRuleList();
+    applyFilter();
+  }
+  function refreshTagRuleList() {
+    const list = document.getElementById("tag-rule-list");
+    const none = document.getElementById("no-tag-rules");
+    list.innerHTML = "";
+    if (!tagRules.length) {
+      none.style.display = "block";
+      none.textContent = tagIndex.size ? "No tag filters yet." : "No tag filters. Load POIs to choose tags.";
+      return;
+    }
+    none.style.display = "none";
+    for (const rule of tagRules) {
+      let n = 0;
+      for (const p of pois) if (matchTagRule(p, rule)) n++;
+
+      const li = document.createElement("li");
+      const main = document.createElement("div");
+      main.className = "rule-main";
+
+      const chip = document.createElement("button");
+      chip.className = "mode-chip";
+      chip.style.background = rule.mode === "include" ? "var(--include)" : "var(--exclude)";
+      chip.title = "Click to toggle include/exclude";
+      chip.textContent = rule.mode === "include" ? "incl" : "excl";
+      chip.addEventListener("click", () => {
+        rule.mode = rule.mode === "include" ? "exclude" : "include";
+        refreshTagRuleList();
+        applyFilter();
+      });
+
+      const text = document.createElement("span");
+      text.className = "rule-text";
+      text.innerHTML = rule.value === null
+        ? `<code>${escapeHtml(rule.key)}</code> <span style="color:#888">(any)</span>`
+        : `<code>${escapeHtml(rule.key)}=${escapeHtml(rule.value)}</code>`;
+
+      main.appendChild(chip);
+      main.appendChild(text);
+
+      const right = document.createElement("div");
+      right.className = "rule-right";
+      const count = document.createElement("span");
+      count.className = "count";
+      count.textContent = n;
+      count.title = `${n} POIs match`;
+      const del = document.createElement("button");
+      del.className = "del";
+      del.title = "Delete filter";
+      del.textContent = "✕";
+      del.addEventListener("click", () => {
+        const idx = tagRules.indexOf(rule);
+        if (idx >= 0) tagRules.splice(idx, 1);
+        refreshTagRuleList();
+        applyFilter();
+      });
+      right.appendChild(count);
+      right.appendChild(del);
+
+      li.appendChild(main);
+      li.appendChild(right);
+      list.appendChild(li);
+    }
   }
 
   // ---------- GPX route ----------
@@ -486,6 +721,16 @@
 
   document.getElementById("show-removed").addEventListener("change", applyFilter);
 
+  // ---------- Tag filter events ----------
+  document.getElementById("tag-mode-toggle").addEventListener("click", (e) => {
+    const btn = e.target.closest("button");
+    if (!btn) return;
+    tagMode = btn.dataset.mode;
+    document.querySelectorAll("#tag-mode-toggle button").forEach((b) => b.classList.toggle("active", b === btn));
+  });
+  document.getElementById("tag-key").addEventListener("change", populateTagValueSelect);
+  document.getElementById("tag-add-btn").addEventListener("click", addTagRule);
+
   // ---------- Export ----------
   function exportJson() {
     const out = [];
@@ -500,6 +745,7 @@
         sym: p.sym,
         categories: p.categories,
         osmid: p.osmid,
+        tags: p.tags,
       });
     }
     const blob = new Blob([JSON.stringify(out, null, 2) + "\n"], { type: "application/json" });

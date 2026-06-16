@@ -28,8 +28,17 @@ Then:
      (minus anything excluded). With no include areas, everything is kept except
      excludes.
    - Edit/delete shapes via the draw toolbar or the **Areas** list. Counts update live.
-4. **Download filtered JSON** — exports the kept POIs as `pois-filtered.json`, identical
-   in shape (`name, lat, lon, desc, sym, categories, osmid`) to the input.
+4. **Tag filters** — prune by OSM tags instead of (or as well as) geography:
+   - Pick a mode (**Exclude** / **Include**), choose a tag **key** (and optionally a
+     specific **value**, or leave it as *(any value)*), then **Add**. Keys and values are
+     drawn from the loaded POIs and annotated with how many carry them.
+   - **Exclude** drops POIs whose tags match; if any **Include** filter exists, only POIs
+     matching an include filter are kept. Each filter shows a live match count; click its
+     `excl`/`incl` chip to flip the mode, or ✕ to remove it.
+   - Tag filters apply **on top of (AND with)** the area filters — a POI is kept only when
+     it survives both.
+5. **Download filtered JSON** — exports the kept POIs as `pois-filtered.json`, identical
+   in shape (`name, lat, lon, desc, sym, categories, osmid, tags`) to the input.
 
 ## Generating input
 

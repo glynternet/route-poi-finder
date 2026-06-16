@@ -61,14 +61,14 @@ type response struct {
 }
 
 type element struct {
-	Type     string                 `json:"type"`
-	ID       int64                  `json:"id"`
-	Lat      float64                `json:"lat"`
-	Lon      float64                `json:"lon"`
-	Nodes    []int64                `json:"nodes"`
-	Tags     map[string]interface{} `json:"tags"`
-	Geometry []LatLon               `json:"geometry"`
-	Members  []member               `json:"members"`
+	Type     string            `json:"type"`
+	ID       int64             `json:"id"`
+	Lat      float64           `json:"lat"`
+	Lon      float64           `json:"lon"`
+	Nodes    []int64           `json:"nodes"`
+	Tags     map[string]string `json:"tags"`
+	Geometry []LatLon          `json:"geometry"`
+	Members  []member          `json:"members"`
 }
 
 type member struct {
@@ -90,7 +90,7 @@ type LatLon struct {
 type wayPoint struct {
 	ID   int64
 	Loc  LatLon
-	Tags map[string]interface{}
+	Tags map[string]string
 }
 
 // Point is stolen from gpx project, should really import it instead
@@ -103,6 +103,10 @@ type Point struct {
 	Symbol      string   `json:"sym"`
 	Categories  []string `json:"categories"`
 	OSMID       int64    `json:"osmid"`
+	// Tags carries the raw OSM tags as structured key/value pairs so downstream
+	// consumers (e.g. the triage UI) can filter on them directly rather than
+	// re-parsing the JSON embedded in Description.
+	Tags map[string]string `json:"tags"`
 }
 
 // workUnit represents a single split's worth of work for the worker pool.
@@ -706,7 +710,7 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 	getPoint, getStats := point(namePrefix)
 
 	pois := make(map[string]Point)
-	addPoint := func(id int64, tags map[string]interface{}, loc LatLon) error {
+	addPoint := func(id int64, tags map[string]string, loc LatLon) error {
 		pt, err := getPoint(id, tags, loc)
 		if err != nil {
 			return fmt.Errorf("getting point for item: %w", err)
@@ -863,11 +867,11 @@ func (os occurrences[T]) topK(k int) []valueFreq[T] {
 	return vfs
 }
 
-func point(namePrefix string) (func(id int64, tags map[string]interface{}, latLon LatLon) (Point, error), func(topK int) stats) {
+func point(namePrefix string) (func(id int64, tags map[string]string, latLon LatLon) (Point, error), func(topK int) stats) {
 	var totalPoints int
 	tagOccurrences := make(occurrences[string])
 	tagValueOccurrences := make(occurrences[string])
-	return func(id int64, tags map[string]interface{}, latLon LatLon) (Point, error) {
+	return func(id int64, tags map[string]string, latLon LatLon) (Point, error) {
 			name, err := resolveName(tags)
 			if err != nil {
 				return Point{}, fmt.Errorf("resolving name from tags(%v): %w", tags, err)
@@ -878,7 +882,7 @@ func point(namePrefix string) (func(id int64, tags map[string]interface{}, latLo
 			}
 			for tag, value := range tags {
 				tagOccurrences.mark(tag)
-				tagValueOccurrences.mark(tag + ":" + value.(string))
+				tagValueOccurrences.mark(tag + ":" + value)
 			}
 			symbol, cats := resolveSymbolAndCategories(tags)
 			if symbol == "" {
@@ -892,6 +896,7 @@ func point(namePrefix string) (func(id int64, tags map[string]interface{}, latLo
 				Description: string(desc),
 				Symbol:      symbol,
 				Categories:  cats,
+				Tags:        tags,
 			}
 			totalPoints++
 			return nodePoint, nil
@@ -1189,7 +1194,7 @@ func atomicSlurp(cacheDir string, resp io.Reader, path string) error {
 	return nil
 }
 
-func resolveName(tags map[string]interface{}) (string, error) {
+func resolveName(tags map[string]string) (string, error) {
 	for _, tag := range []string{
 		"name",
 		"name:en",
@@ -1206,21 +1211,12 @@ func resolveName(tags map[string]interface{}) (string, error) {
 		"man_made",
 		"drinking_water",
 	} {
-		n, ok := tags[tag]
-		if ok {
-			n, ok := n.(string)
-			if !ok {
-				return "", fmt.Errorf("tag '%s' is not a string", tag)
-			}
+		if n, ok := tags[tag]; ok {
 			return n, nil
 		}
 	}
 	var yesTags []string
 	for tag, v := range tags {
-		v, ok := v.(string)
-		if !ok {
-			return "", fmt.Errorf("tag '%s' is not a string", tag)
-		}
 		if v == "yes" {
 			yesTags = append(yesTags, tag)
 		}
@@ -1233,7 +1229,7 @@ func resolveName(tags map[string]interface{}) (string, error) {
 	return "", errors.New("no suitable tag for name")
 }
 
-func resolveSymbolAndCategories(tags map[string]interface{}) (string, []string) {
+func resolveSymbolAndCategories(tags map[string]string) (string, []string) {
 	// symbol is meant to be a symbol that make sense on a Garmin GPC
 	// category is meant to be a more fine-grained category for an item
 	var symbols []string
@@ -1310,11 +1306,7 @@ func resolveSymbolAndCategories(tags map[string]interface{}) (string, []string) 
 	} {
 		match := true
 		for k, matcher := range symbolMatchers.tags {
-			// Tags are map[string]interface{} from JSON decoding. Use a type
-			// assertion to string rather than comparing interface{} values
-			// directly, which would silently fail if the JSON decoder ever
-			// produced a non-string type for a tag value.
-			v, ok := tags[k].(string)
+			v, ok := tags[k]
 			if !ok {
 				match = false
 				break
