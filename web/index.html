@@ -222,10 +222,25 @@
 
   // ---------- Map ----------
   const map = L.map("map", { preferCanvas: true }).setView([46.8, 8.2], 6);
-  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+
+  // Base layers: OSM streets and Esri World Imagery satellite. Leaflet itself is
+  // tile-source agnostic, so "satellite" is just a different tile URL template.
+  const streets = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
     maxZoom: 19,
     attribution: "&copy; OpenStreetMap contributors",
-  }).addTo(map);
+  });
+  const satellite = L.tileLayer(
+    "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    {
+      maxZoom: 19,
+      attribution: "Tiles &copy; Esri — Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community",
+    });
+  streets.addTo(map); // default base layer
+
+  L.control.layers({ "Streets": streets, "Satellite": satellite }, null, { position: "topright" }).addTo(map);
+
+  // Distance scale (metric + imperial) in the bottom-left corner.
+  L.control.scale({ imperial: true, metric: true }).addTo(map);
 
   // Dedicated pane so the route line sits beneath POI markers.
   map.createPane("routePane");
