@@ -100,6 +100,12 @@
     #drop-overlay.show { display: flex; }
 
     .leaflet-popup-content { font-size: 13px; }
+    .area-popup { min-width: 170px; }
+    .area-popup .area-popup-title { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #888; margin-bottom: 6px; }
+    .area-popup .ap-name { width: 100%; box-sizing: border-box; font-size: 13px; padding: 6px; border: 1px solid #bbb; border-radius: 6px; margin: 0 0 8px; }
+    .area-popup .mode-toggle { margin-bottom: 8px; }
+    .area-popup .ap-del { width: 100%; margin: 0; color: var(--exclude); border-color: var(--exclude); }
+    .area-popup .ap-del:hover { background: var(--exclude); color: #fff; }
     .poi-pop b { font-size: 14px; }
     .poi-pop table { border-collapse: collapse; margin-top: 6px; }
     .poi-pop td { padding: 1px 6px 1px 0; vertical-align: top; }
@@ -370,16 +376,17 @@
   map.createPane("routePane");
   map.getPane("routePane").style.zIndex = 350;
 
-  // Drawn include/exclude areas render here: above the route line but BELOW the
-  // POI markers (overlayPane = 400), for clean visual layering.
+  // Filter areas render here: above the route line but BELOW the POI markers
+  // (default markerPane = 600), for clean visual layering.
   //
-  // Crucially the areas use an SVG renderer, not canvas. A canvas renderer is a
-  // single viewport-sized element with pointer-events:auto (it does its own hit
-  // testing), so once a shape's canvas is on top it swallows EVERY click across
-  // the whole map and no marker is clickable. Leaflet's SVG overlay instead has
-  // pointer-events:none except on painted interactive paths; combined with
-  // interactive:false on the shapes (see drawControl below), the areas capture
-  // no clicks at all and every click falls through to the POI markers.
+  // The areas use an SVG renderer, not canvas. A canvas renderer is a single
+  // viewport-sized element that does its own hit testing, so a shape's canvas on
+  // top swallows EVERY click across the map and no marker is clickable. Leaflet's
+  // SVG overlay instead only captures clicks on the painted path of each
+  // *interactive* shape. The areas ARE interactive (click one to open its editor
+  // popup), but because they sit in a lower pane than the markers, clicking a
+  // marker still hits the marker — only clicks on an area's empty interior reach
+  // the area. This also lets the draw toolbar's trash tool target shapes directly.
   map.createPane("areaPane");
   map.getPane("areaPane").style.zIndex = 360;
   const areaRenderer = L.svg({ pane: "areaPane" });
@@ -803,12 +810,12 @@
   const drawControl = new L.Control.Draw({
     edit: { featureGroup: drawnItems, remove: true },
     draw: {
-      // interactive:false => the shape's SVG path gets pointer-events:none, so it
-      // never intercepts clicks meant for the POI markers underneath. Areas are
-      // managed via the Areas list (delete) and the draw toolbar (edit handles
-      // live in their own pane and work regardless of the path being passive).
-      polygon: { allowIntersection: false, showArea: false, shapeOptions: { renderer: areaRenderer, interactive: false } },
-      rectangle: { shapeOptions: { renderer: areaRenderer, interactive: false } },
+      // interactive:true => the shape's SVG path is clickable and opens the area's
+      // editor popup (name / mode / delete). Markers live in a higher pane so they
+      // still receive their own clicks; only clicks on an area's empty interior
+      // hit the area. This also lets the draw toolbar's trash tool target shapes.
+      polygon: { allowIntersection: false, showArea: false, shapeOptions: { renderer: areaRenderer, interactive: true } },
+      rectangle: { shapeOptions: { renderer: areaRenderer, interactive: true } },
       polyline: false, circle: false, marker: false, circlemarker: false,
     },
   });
@@ -816,10 +823,64 @@
 
   function registerArea(layer, mode) {
     const ring = ringFromLayer(layer);
-    const area = { id: ++areaSeq, layer, mode, ring, bbox: bboxOf(ring) };
+    const area = { id: ++areaSeq, layer, mode, name: "", ring, bbox: bboxOf(ring) };
     layer.setStyle(styleForMode(mode));
+    bindAreaPopup(area);
     areas.push(area);
     return area;
+  }
+
+  // Clicking an area opens an inline editor: rename it, flip its include/exclude
+  // mode, or delete it. The popup is bound once per area; its content is rebuilt
+  // on every open so it always reflects the area's current name and mode.
+  function bindAreaPopup(area) {
+    area.layer.bindPopup(() => buildAreaPopup(area), { minWidth: 190, autoPan: true });
+  }
+
+  function buildAreaPopup(area) {
+    const wrap = L.DomUtil.create("div", "area-popup");
+
+    const title = L.DomUtil.create("div", "area-popup-title", wrap);
+    title.textContent = `Area #${area.id}`;
+
+    const name = L.DomUtil.create("input", "ap-name", wrap);
+    name.type = "text";
+    name.placeholder = "(unnamed)";
+    name.value = area.name || "";
+    name.addEventListener("input", () => {
+      area.name = name.value;
+      refreshAreaList(); // name doesn't affect filtering, so no applyFilter here
+      saveState();
+    });
+
+    const toggle = L.DomUtil.create("div", "mode-toggle", wrap);
+    for (const m of ["exclude", "include"]) {
+      const b = L.DomUtil.create("button", m, toggle);
+      b.textContent = m === "include" ? "Include" : "Exclude";
+      b.classList.toggle("active", area.mode === m);
+      b.addEventListener("click", () => {
+        if (area.mode === m) return;
+        area.mode = m;
+        area.layer.setStyle(styleForMode(m));
+        toggle.querySelectorAll("button").forEach((x) => x.classList.toggle("active", x === b));
+        refreshAreaList();
+        applyFilter(); // also persists via saveState()
+      });
+    }
+
+    const del = L.DomUtil.create("button", "ap-del", wrap);
+    del.textContent = "Delete area";
+    del.addEventListener("click", () => {
+      area.layer.closePopup();
+      removeArea(area);
+      refreshAreaList();
+      applyFilter();
+    });
+
+    // Keep clicks/scroll inside the editor from falling through to the map.
+    L.DomEvent.disableClickPropagation(wrap);
+    L.DomEvent.disableScrollPropagation(wrap);
+    return wrap;
   }
   function updateAreaGeometry(area) {
     area.ring = ringFromLayer(area.layer);
@@ -865,7 +926,8 @@
       const li = document.createElement("li");
       const color = area.mode === "include" ? "var(--include)" : "var(--exclude)";
       const label = area.mode === "include" ? "Include" : "Exclude";
-      li.innerHTML = `<span><span class="swatch" style="background:${color}"></span>${label} #${area.id}</span>`;
+      const text = area.name ? escapeHtml(area.name) : `${label} #${area.id}`;
+      li.innerHTML = `<span title="${label} #${area.id}"><span class="swatch" style="background:${color}"></span>${text}</span>`;
       const del = document.createElement("button");
       del.className = "del";
       del.title = "Delete area";
@@ -902,12 +964,31 @@
   // them declutters the map but does NOT change filtering — the areas array and
   // applyFilter() are untouched. All shapes render in areaPane, so flipping that
   // pane's display hides/shows them in one move without disturbing the layers.
-  function applyAreaVisibility() {
-    const on = document.getElementById("show-areas").checked;
+  function setAreaPaneVisible(on) {
     map.getPane("areaPane").style.display = on ? "" : "none";
+  }
+  function applyAreaVisibility() {
+    setAreaPaneVisible(document.getElementById("show-areas").checked);
     saveState();
   }
   document.getElementById("show-areas").addEventListener("change", applyAreaVisibility);
+
+  // While a draw OR edit session is active, force the area pane visible so the
+  // shape being drawn/edited is always seen — otherwise, with "Show filter areas"
+  // off, the pane is display:none and the live rectangle/polygon (which renders
+  // into the same pane) would be invisible, leaving you dragging vertices on an
+  // unseen shape. On stop, restore the pane to the checkbox state; any new or
+  // edited area then hides along with the rest.
+  map.on(L.Draw.Event.DRAWSTART, () => setAreaPaneVisible(true));
+  map.on(L.Draw.Event.DRAWSTOP, () => setAreaPaneVisible(document.getElementById("show-areas").checked));
+  map.on(L.Draw.Event.EDITSTART, () => setAreaPaneVisible(true));
+  map.on(L.Draw.Event.EDITSTOP, () => setAreaPaneVisible(document.getElementById("show-areas").checked));
+
+  // Reveal hidden areas during delete mode too, so you can see (and click) the
+  // shape you want the trash tool to remove. Areas are interactive by default, so
+  // no per-shape pointer-events juggling is needed — just make sure they're shown.
+  map.on(L.Draw.Event.DELETESTART, () => setAreaPaneVisible(true));
+  map.on(L.Draw.Event.DELETESTOP, () => setAreaPaneVisible(document.getElementById("show-areas").checked));
 
   // ---------- Tag filter events ----------
   document.getElementById("tag-mode-toggle").addEventListener("click", (e) => {
@@ -979,7 +1060,7 @@
       pois: pois.map(cleanPoi),
       routePts,
       // Areas are stored as plain rings; their Leaflet layers are rebuilt on load.
-      areas: areas.map((a) => ({ id: a.id, mode: a.mode, ring: a.ring })),
+      areas: areas.map((a) => ({ id: a.id, mode: a.mode, name: a.name || "", ring: a.ring })),
       areaSeq,
       tagRules: tagRules.map((r) => ({ id: r.id, mode: r.mode, key: r.key, value: r.value })),
       tagRuleSeq,
@@ -1031,10 +1112,12 @@
       if (Array.isArray(s.areas)) {
         for (const a of s.areas) {
           const layer = L.polygon(a.ring.map((p) => [p.lat, p.lng]),
-            { renderer: areaRenderer, interactive: false });
+            { renderer: areaRenderer, interactive: true });
           drawnItems.addLayer(layer);
           layer.setStyle(styleForMode(a.mode));
-          areas.push({ id: a.id, layer, mode: a.mode, ring: a.ring, bbox: bboxOf(a.ring) });
+          const area = { id: a.id, layer, mode: a.mode, name: a.name || "", ring: a.ring, bbox: bboxOf(a.ring) };
+          bindAreaPopup(area);
+          areas.push(area);
         }
         areaSeq = s.areaSeq || areas.reduce((m, a) => Math.max(m, a.id), 0);
         refreshAreaList();
