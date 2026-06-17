@@ -104,21 +104,44 @@
     .poi-pop table { border-collapse: collapse; margin-top: 6px; }
     .poi-pop td { padding: 1px 6px 1px 0; vertical-align: top; }
     .poi-pop td.k { color: #888; white-space: nowrap; }
+    .poi-pop a { color: #1565c0; }
+
+    /* POI markers: a coloured disc holding a white Maki/Temaki glyph, plus an
+       always-on name label baked into the same icon so opacity/visibility apply
+       to icon + label together. */
+    .poi-divicon { background: none; border: none; white-space: nowrap; }
+    .poi-divicon .poi-ico {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 18px; height: 18px; border-radius: 50%;
+      box-shadow: 0 0 0 1.5px #fff, 0 1px 3px rgba(0,0,0,.45);
+      vertical-align: middle;
+    }
+    .poi-divicon .poi-ico img {
+      width: 12px; height: 12px; display: block; object-fit: contain;
+      /* force the (black) glyph to white on the coloured disc */
+      filter: brightness(0) invert(1);
+    }
+    .poi-divicon .poi-lbl {
+      margin-left: 4px; font-size: 11px; font-weight: 600; color: #1a1a1a;
+      vertical-align: middle;
+      text-shadow: 0 0 2px #fff, 0 0 2px #fff, 0 0 2px #fff, 0 0 2px #fff;
+    }
+    #map.labels-off .poi-divicon .poi-lbl { display: none; }
   </style>
 </head>
 <body>
   <div id="app">
     <div id="panel">
       <h1>POI triage</h1>
-      <p class="sub">Load route-poi-finder output, prune it, export the same JSON.</p>
+      <p class="sub">Load route-poi-finder output, prune it, export the same GeoJSON.</p>
 
       <section>
         <h2>Load</h2>
-        <label class="btn" for="poi-input">Load POI JSON</label>
-        <input type="file" id="poi-input" accept=".json,application/json" />
+        <label class="btn" for="poi-input">Load POI GeoJSON</label>
+        <input type="file" id="poi-input" accept=".geojson,.json,application/geo+json,application/json" />
         <label class="btn" for="gpx-input">Load route GPX</label>
         <input type="file" id="gpx-input" accept=".gpx,application/gpx+xml,application/xml,text/xml" />
-        <div id="status">Drag &amp; drop a POI <code>.json</code> (or route <code>.gpx</code>) anywhere.</div>
+        <div id="status">Drag &amp; drop a POI <code>.geojson</code> (or route <code>.gpx</code>) anywhere.</div>
         <p class="hint">Your session is saved in this browser and restored on refresh.</p>
         <button id="clear-session-btn">Clear saved session</button>
       </section>
@@ -142,6 +165,7 @@
           selected mode. <b>Exclude</b> drops POIs inside it. If any <b>Include</b>
           area exists, only POIs inside an include area are kept (minus excludes).</p>
         <label class="check"><input type="checkbox" id="show-removed" /> Show removed POIs (faded)</label>
+        <label class="check"><input type="checkbox" id="show-labels" checked /> Show name labels</label>
       </section>
 
       <section>
@@ -189,26 +213,41 @@
   <script>
   "use strict";
 
-  // ---------- Symbol colour palette ----------
-  const SYMBOL_COLORS = {
+  // ---------- Category colour palette ----------
+  // Keyed off the POI's primary `category` (the GeoJSON property). Dynamic,
+  // open-ended categories (from the amenity catch-all) fall back to a stable
+  // hashed hue so they still get a consistent colour.
+  const CATEGORY_COLORS = {
     "Drinking Water": "#1f78b4",
     "Water Source": "#6baed6",
+    "Waterway": "#3182bd",
     "Restaurant": "#e31a1c",
-    "Fast Food": "#ff7f00",
-    "Pizza": "#fb9a99",
-    "Bar": "#b15928",
-    "Shopping Center": "#33a02c",
     "Gas Station": "#6a3d9a",
-    "Campground": "#117733",
-    "Building": "#377eb8",
+    "Resupply": "#33a02c",
+    "Bakery": "#a0522d",
+    "Dairy": "#b8860b",
+    "Farm Shop": "#6b8e23",
+    "Ice Cream": "#d6618f",
+    "Pharmacy": "#009688",
+    "Bicycle Shop": "#2c7fb8",
+    "Sports Shop": "#e6550d",
     "Park": "#4daf4a",
-    "Restroom": "#984ea3",
+    "Campground": "#117733",
+    "Accommodation": "#377eb8",
+    "Shelter": "#7570b3",
+    "Toilets": "#984ea3",
     "Summit": "#8c510a",
-    "Scenic Area": "#d95f02",
-    "Church": "#777777",
-    "City Hall": "#543005",
-    "Picnic Area": "#a6d854",
-    "Mine": "#555555",
+    "Mountain Range": "#a6611a",
+    "Viewpoint": "#d95f02",
+    "Place of Worship": "#777777",
+    "Visitor Centre": "#1b9e77",
+    "Tourist Office": "#1b9e77",
+    "Settlement": "#543005",
+    "Bicycle Repair Station": "#555555",
+    "Ranger Station": "#1b9e77",
+    "Route Start": "#2e7d32",
+    "Route End": "#c62828",
+    "Route Start/Finish": "#1565c0",
   };
 
   function hashHue(str) {
@@ -216,10 +255,92 @@
     for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) | 0;
     return ((h % 360) + 360) % 360;
   }
-  function colorForSymbol(sym) {
-    if (!sym) return "#888888";
-    if (SYMBOL_COLORS[sym]) return SYMBOL_COLORS[sym];
-    return `hsl(${hashHue(sym)}, 65%, 45%)`;
+  function colorForCategory(cat) {
+    if (!cat) return "#888888";
+    if (CATEGORY_COLORS[cat]) return CATEGORY_COLORS[cat];
+    return `hsl(${hashHue(cat)}, 65%, 45%)`;
+  }
+
+  // ---------- Icons (Maki + Temaki + Font Awesome, mixed per-category) ----------
+  // All sets are individual SVGs on the unpkg CDN, loaded as <img> (so they work
+  // from file:// with no CORS) and tinted white via a CSS filter. (jsDelivr was
+  // 301-looping these scoped-package paths, so we use unpkg.) Each entry is
+  // [set, name]; we pick the most suitable glyph from each set. Categories not
+  // listed are auto-matched by sanitising the name to a Maki kebab-case icon, and
+  // a missing icon (404) is dropped at load time, leaving a plain coloured dot.
+  const MAKI = "https://unpkg.com/@mapbox/maki@8.2.0/icons/";
+  const TEMAKI = "https://unpkg.com/@rapideditor/temaki@5.13.0/icons/";
+  const FA = "https://unpkg.com/@fortawesome/fontawesome-free@6.5.2/svgs/solid/";
+  const CATEGORY_ICONS = {
+    "Drinking Water": ["maki", "drinking-water"],
+    "Water Source": ["maki", "water"], // droplet — a point source (spring/well/ford)
+    "Waterway": ["fa", "water"],       // FA "water" is the waves glyph; Maki/Temaki only have a droplet
+    "Restaurant": ["maki", "restaurant"],
+    "Gas Station": ["maki", "fuel"],
+    "Resupply": ["maki", "grocery"],
+    "Bakery": ["maki", "bakery"],
+    "Dairy": ["temaki", "milk_jug"],
+    "Farm Shop": ["maki", "farm"],
+    "Ice Cream": ["maki", "ice-cream"],
+    "Pharmacy": ["maki", "pharmacy"],
+    "Bicycle Shop": ["maki", "bicycle"],
+    "Sports Shop": ["maki", "shop"],
+    "Park": ["maki", "park"],
+    "Campground": ["maki", "campsite"],
+    "Accommodation": ["maki", "lodging"],
+    "Shelter": ["maki", "shelter"],
+    "Toilets": ["maki", "toilet"],
+    "Summit": ["maki", "mountain"],
+    "Mountain Range": ["temaki", "mountain_range"],
+    "Viewpoint": ["maki", "viewpoint"],
+    "Place of Worship": ["maki", "place-of-worship"],
+    "Visitor Centre": ["maki", "ranger-station"],
+    "Tourist Office": ["maki", "information"],
+    "Settlement": ["maki", "town"],
+    "Ranger Station": ["maki", "ranger-station"],
+    "Post Office": ["maki", "post"], // catch-all category; Maki names it "post"
+    "Bicycle Repair Station": ["temaki", "bicycle_repair"], // Maki has no repair glyph
+    // Route endpoints (not POIs) — reuse the marker pipeline.
+    "Route Start": ["fa", "flag"],
+    "Route End": ["fa", "flag-checkered"],
+    "Route Start/Finish": ["fa", "flag-checkered"], // loop routes: combined marker
+  };
+
+  function iconUrl(set, name) {
+    const base = set === "temaki" ? TEMAKI : set === "fa" ? FA : MAKI;
+    return base + name + ".svg";
+  }
+
+  // Resolve a category to an icon URL: the explicit map first, else a best-effort
+  // Maki icon from the sanitised category name. Returns null only for an empty
+  // category. A URL that 404s is dropped at load time (see attachIconFallback).
+  function iconUrlForCategory(cat) {
+    if (!cat) return null;
+    if (CATEGORY_ICONS[cat]) { const [set, name] = CATEGORY_ICONS[cat]; return iconUrl(set, name); }
+    const kebab = cat.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+    return kebab ? iconUrl("maki", kebab) : null;
+  }
+
+  function makeDivIcon(cat, name) {
+    const color = colorForCategory(cat);
+    const url = iconUrlForCategory(cat);
+    const glyph = url
+      ? `<span class="poi-ico" style="background:${color}"><img src="${url}" alt=""></span>`
+      : `<span class="poi-ico" style="background:${color}"></span>`;
+    return L.divIcon({
+      className: "poi-divicon",
+      html: `${glyph}<span class="poi-lbl">${escapeHtml(name || "")}</span>`,
+      iconSize: null,
+      iconAnchor: [9, 9], // centre the 18px disc on the coordinate
+      popupAnchor: [0, -9],
+    });
+  }
+
+  // After a marker's icon is in the DOM, drop a 404'd glyph <img> so only the
+  // coloured disc remains (covers auto-matched categories with no Maki icon).
+  function attachIconFallback(m) {
+    const img = m._icon && m._icon.querySelector("img");
+    if (img) img.addEventListener("error", () => img.remove());
   }
 
   // ---------- Map ----------
@@ -262,13 +383,13 @@
   map.getPane("areaPane").style.zIndex = 360;
   const areaRenderer = L.svg({ pane: "areaPane" });
 
-  const markerRenderer = L.canvas({ padding: 0.5 });
-
   // ---------- State ----------
   let pois = [];            // parsed Point[] from the loaded JSON
-  let markers = [];         // L.circleMarker[], parallel to pois
+  let markers = [];         // L.marker[], parallel to pois (null for coord-less POIs)
   let routeLayer = null;    // L.polyline of the loaded GPX, if any
   let routePts = [];        // [lat,lon][] of the loaded GPX, for persistence
+  let routeStartMarker = null; // flag marker at the route's first point
+  let routeEndMarker = null;   // flag marker at the route's last point
   let drawMode = "exclude"; // current mode for newly drawn shapes
   let areaSeq = 0;          // id counter for drawn areas
   const areas = [];         // { id, layer, mode, ring:[{lat,lng}], bbox }
@@ -315,22 +436,11 @@
   }
 
   // ---------- Tags ----------
-  // tagsOf returns a POI's OSM tags as a plain object, preferring the structured
-  // `tags` field and falling back to parsing the JSON embedded in `desc` for
-  // older output files that predate the tags field. The result is cached on the
-  // POI so repeated filtering does not re-parse.
+  // tagsOf returns a POI's OSM tags as a plain object from the structured `tags`
+  // property. Cached on the POI so repeated filtering does not re-read.
   function tagsOf(p) {
     if (p._tags) return p._tags;
-    let t = null;
-    if (p.tags && typeof p.tags === "object") {
-      t = p.tags;
-    } else if (p.desc) {
-      try {
-        const parsed = JSON.parse(p.desc);
-        if (parsed && typeof parsed === "object") t = parsed;
-      } catch (e) { /* desc is not JSON-encoded tags; treat as having none */ }
-    }
-    p._tags = t || {};
+    p._tags = (p.tags && typeof p.tags === "object") ? p.tags : {};
     return p._tags;
   }
 
@@ -391,12 +501,15 @@
       const m = markers[i];
       if (!m) continue;
       if (k) {
-        m.setStyle({ opacity: 1, fillOpacity: 0.85 });
+        if (!map.hasLayer(m)) { m.addTo(map); attachIconFallback(m); }
+        m.setOpacity(1);
         kept++;
       } else if (showRemoved) {
-        m.setStyle({ opacity: 0.25, fillOpacity: 0.12 });
-      } else {
-        m.setStyle({ opacity: 0, fillOpacity: 0 });
+        if (!map.hasLayer(m)) { m.addTo(map); attachIconFallback(m); }
+        m.setOpacity(0.35);
+      } else if (map.hasLayer(m)) {
+        // Fully remove (not just fade) so filtered-out markers can't be clicked.
+        map.removeLayer(m);
       }
     }
     document.getElementById("c-total").textContent = pois.length;
@@ -416,24 +529,26 @@
     let rows = "";
     const tags = tagsOf(p);
     const keys = Object.keys(tags).sort();
-    if (keys.length) {
-      for (const k of keys) {
-        rows += `<tr><td class="k">${escapeHtml(k)}</td><td>${escapeHtml(tags[k])}</td></tr>`;
-      }
-    } else if (p.desc) {
-      rows = `<tr><td colspan="2">${escapeHtml(p.desc)}</td></tr>`;
+    for (const k of keys) {
+      rows += `<tr><td class="k">${escapeHtml(k)}</td><td>${escapeHtml(tags[k])}</td></tr>`;
     }
     const cats = (p.categories && p.categories.length) ? escapeHtml(p.categories.join(", ")) : "—";
+    let osm = "—";
+    if (p.osm_type && p.osmid != null) {
+      const ref = `${p.osm_type}/${p.osmid}`;
+      osm = `<a href="https://www.openstreetmap.org/${escapeHtml(ref)}" target="_blank" rel="noopener">${escapeHtml(ref)}</a>`;
+    }
     return `<div class="poi-pop">
       <b>${escapeHtml(p.name || "(unnamed)")}</b><br>
-      <span style="color:#666">sym:</span> ${escapeHtml(p.sym || "—")}
-      &nbsp; <span style="color:#666">cat:</span> ${cats}
+      <span style="color:#666">category:</span> ${escapeHtml(p.category || "—")}
+      &nbsp; <span style="color:#666">all:</span> ${cats}<br>
+      <span style="color:#666">osm:</span> ${osm}
       <table>${rows}</table>
     </div>`;
   }
 
   function clearPois() {
-    for (const m of markers) map.removeLayer(m);
+    for (const m of markers) if (m) map.removeLayer(m);
     markers = [];
     pois = [];
   }
@@ -445,16 +560,14 @@
     for (let i = 0; i < pois.length; i++) {
       const p = pois[i];
       if (typeof p.lat !== "number" || typeof p.lon !== "number") { markers.push(null); continue; }
-      const m = L.circleMarker([p.lat, p.lon], {
-        renderer: markerRenderer,
-        radius: 6,
-        color: "#333",
-        weight: 1,
-        fillColor: colorForSymbol(p.sym),
-        fillOpacity: 0.85,
+      const m = L.marker([p.lat, p.lon], {
+        icon: makeDivIcon(p.category, p.name),
+        opacity: 1,
+        riseOnHover: true,
       });
       m.bindPopup(() => popupHtml(p), { maxWidth: 320 });
       m.addTo(map);
+      attachIconFallback(m);
       markers.push(m);
       pts.push([p.lat, p.lon]);
     }
@@ -469,16 +582,16 @@
   function buildLegend() {
     const seen = new Map();
     for (const p of pois) {
-      const s = p.sym || "(none)";
-      seen.set(s, (seen.get(s) || 0) + 1);
+      const c = p.category || "(none)";
+      seen.set(c, (seen.get(c) || 0) + 1);
     }
     const el = document.getElementById("legend");
     el.innerHTML = "";
-    [...seen.entries()].sort((a, b) => b[1] - a[1]).forEach(([sym, n]) => {
+    [...seen.entries()].sort((a, b) => b[1] - a[1]).forEach(([cat, n]) => {
       const row = document.createElement("div");
       row.className = "row";
-      row.innerHTML = `<span class="dot" style="background:${colorForSymbol(sym === "(none)" ? "" : sym)}"></span>` +
-        `<span>${escapeHtml(sym)} (${n})</span>`;
+      row.innerHTML = `<span class="dot" style="background:${colorForCategory(cat === "(none)" ? "" : cat)}"></span>` +
+        `<span>${escapeHtml(cat)} (${n})</span>`;
       el.appendChild(row);
     });
   }
@@ -626,6 +739,42 @@
   }
 
   // ---------- GPX route ----------
+  // clearRoute/drawRoute manage the polyline plus the start/end flag markers as a
+  // unit. The flags are separate from the POI markers, so POI filtering never
+  // hides them. Shared by GPX loading and session restore.
+  function clearRoute() {
+    for (const layer of [routeLayer, routeStartMarker, routeEndMarker]) {
+      if (layer) map.removeLayer(layer);
+    }
+    routeLayer = routeStartMarker = routeEndMarker = null;
+  }
+  // Endpoints within ~30 m count as the same place — loop routes rarely repeat
+  // the exact same coordinate.
+  function sameSpot(a, b) {
+    const dLat = Math.abs(a[0] - b[0]);
+    const dLon = Math.abs(a[1] - b[1]) * Math.cos((a[0] * Math.PI) / 180);
+    return dLat < 0.0003 && dLon < 0.0003;
+  }
+  function drawRoute(pts) {
+    clearRoute();
+    routePts = pts;
+    routeLayer = L.polyline(pts, { pane: "routePane", color: "#1565c0", weight: 3, opacity: 0.75 }).addTo(map);
+    const start = pts[0], end = pts[pts.length - 1];
+    // zIndexOffset keeps the flags above POI markers so they're always visible.
+    const addFlag = (latlng, cat, label) => {
+      const m = L.marker(latlng, { icon: makeDivIcon(cat, label), zIndexOffset: 1000 }).addTo(map);
+      attachIconFallback(m);
+      return m;
+    };
+    if (sameSpot(start, end)) {
+      // Loop route: one combined marker instead of overlapping Start + Finish.
+      routeStartMarker = addFlag(start, "Route Start/Finish", "Start/Finish");
+    } else {
+      routeStartMarker = addFlag(start, "Route Start", "Start");
+      routeEndMarker = addFlag(end, "Route End", "Finish");
+    }
+  }
+
   function renderGpx(xmlText) {
     const doc = new DOMParser().parseFromString(xmlText, "application/xml");
     if (doc.getElementsByTagName("parsererror").length) throw new Error("invalid GPX XML");
@@ -637,9 +786,7 @@
       if (!Number.isNaN(lat) && !Number.isNaN(lon)) pts.push([lat, lon]);
     }
     if (!pts.length) throw new Error("no <trkpt> points found in GPX");
-    if (routeLayer) map.removeLayer(routeLayer);
-    routePts = pts;
-    routeLayer = L.polyline(pts, { pane: "routePane", color: "#1565c0", weight: 3, opacity: 0.75 }).addTo(map);
+    drawRoute(pts);
     if (!pois.length) map.fitBounds(routeLayer.getBounds().pad(0.05));
     saveState();
     return pts.length;
@@ -743,6 +890,13 @@
 
   document.getElementById("show-removed").addEventListener("change", applyFilter);
 
+  function applyLabelVisibility() {
+    const on = document.getElementById("show-labels").checked;
+    document.getElementById("map").classList.toggle("labels-off", !on);
+    saveState();
+  }
+  document.getElementById("show-labels").addEventListener("change", applyLabelVisibility);
+
   // ---------- Tag filter events ----------
   document.getElementById("tag-mode-toggle").addEventListener("click", (e) => {
     const btn = e.target.closest("button");
@@ -755,26 +909,33 @@
   document.getElementById("tag-add-btn").addEventListener("click", addTagRule);
 
   // ---------- Export ----------
+  // Export the kept POIs as a GeoJSON FeatureCollection in the same schema the Go
+  // tool emits (RFC 7946: [lon, lat], WGS84, namespaced feature id).
   function exportJson() {
-    const out = [];
+    const features = [];
     for (let i = 0; i < pois.length; i++) {
       if (!pois[i]._kept) continue;
       const p = pois[i];
-      out.push({
-        name: p.name,
-        lat: p.lat,
-        lon: p.lon,
-        desc: p.desc,
-        sym: p.sym,
-        categories: p.categories,
-        osmid: p.osmid,
-        tags: p.tags,
-      });
+      const f = {
+        type: "Feature",
+        geometry: { type: "Point", coordinates: [p.lon, p.lat] },
+        properties: {
+          name: p.name,
+          category: p.category,
+          categories: p.categories,
+          osm_type: p.osm_type,
+          osmid: p.osmid,
+          tags: p.tags,
+        },
+      };
+      if (p.osm_type && p.osmid != null) f.id = `${p.osm_type}/${p.osmid}`;
+      features.push(f);
     }
-    const blob = new Blob([JSON.stringify(out, null, 2) + "\n"], { type: "application/json" });
+    const fc = { type: "FeatureCollection", features };
+    const blob = new Blob([JSON.stringify(fc, null, 2) + "\n"], { type: "application/geo+json" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = "pois-filtered.json";
+    a.download = "pois-filtered.geojson";
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -785,7 +946,7 @@
   // ---------- Persistence ----------
   // The whole session (POIs, route, drawn areas, tag filters, modes) is mirrored
   // into localStorage so a page refresh restores exactly where you left off.
-  const STORAGE_KEY = "route-poi-triage-state-v1";
+  const STORAGE_KEY = "route-poi-triage-state-v2";
   let saveTimer = null;   // debounce handle
   let restoring = false;  // suppress saves while restoreState() rebuilds state
 
@@ -813,6 +974,7 @@
       drawMode,
       tagMode,
       showRemoved: document.getElementById("show-removed").checked,
+      showLabels: document.getElementById("show-labels").checked,
     };
   }
 
@@ -846,8 +1008,7 @@
     restoring = true;
     try {
       if (Array.isArray(s.routePts) && s.routePts.length) {
-        routePts = s.routePts;
-        routeLayer = L.polyline(routePts, { pane: "routePane", color: "#1565c0", weight: 3, opacity: 0.75 }).addTo(map);
+        drawRoute(s.routePts);
       }
       if (Array.isArray(s.pois) && s.pois.length) {
         renderPois(s.pois); // rebuilds markers, legend, tag index and selects
@@ -873,6 +1034,9 @@
       if (s.drawMode) { drawMode = s.drawMode; setToggleActive("mode-toggle", drawMode); }
       if (s.tagMode) { tagMode = s.tagMode; setToggleActive("tag-mode-toggle", tagMode); }
       if (s.showRemoved) document.getElementById("show-removed").checked = true;
+      if (s.showLabels === false) document.getElementById("show-labels").checked = false;
+      document.getElementById("map").classList.toggle(
+        "labels-off", !document.getElementById("show-labels").checked);
     } finally {
       restoring = false;
     }
@@ -896,17 +1060,40 @@
   }
   function looksLikeGpx(name, text) {
     if (/\.gpx$/i.test(name)) return true;
-    if (/\.json$/i.test(name)) return false;
+    if (/\.(geo)?json$/i.test(name)) return false;
     return /^\s*</.test(text) || text.includes("<gpx");
   }
+
+  // featuresToPois flattens a GeoJSON FeatureCollection into the internal POI
+  // shape the rest of the UI uses: lat/lon hoisted from geometry.coordinates
+  // ([lon, lat]) and the feature properties spread alongside.
+  function featuresToPois(fc) {
+    if (!fc || fc.type !== "FeatureCollection" || !Array.isArray(fc.features)) {
+      throw new Error("expected a GeoJSON FeatureCollection");
+    }
+    return fc.features.map((f) => {
+      const coords = (f.geometry && f.geometry.coordinates) || [];
+      const props = f.properties || {};
+      return {
+        lat: coords[1],
+        lon: coords[0],
+        name: props.name,
+        category: props.category,
+        categories: props.categories || [],
+        osm_type: props.osm_type,
+        osmid: props.osmid,
+        tags: props.tags || {},
+      };
+    });
+  }
+
   function handleText(name, text) {
     try {
       if (looksLikeGpx(name, text)) {
         const n = renderGpx(text);
         setStatus(`Route loaded: ${n} points${name ? " (" + name + ")" : ""}.`);
       } else {
-        const data = JSON.parse(text);
-        if (!Array.isArray(data)) throw new Error("expected a JSON array of POIs");
+        const data = featuresToPois(JSON.parse(text));
         renderPois(data);
         setStatus(`Loaded ${data.length} POIs${name ? " from " + name : ""}.`);
       }
