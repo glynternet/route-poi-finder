@@ -88,25 +88,83 @@ type LatLon struct {
 }
 
 type wayPoint struct {
+	Type string // "way" or "relation"
 	ID   int64
 	Loc  LatLon
 	Tags map[string]string
 }
 
-// Point is stolen from gpx project, should really import it instead
+// Point is the internal representation of a resolved POI, collected before being
+// written out as a GeoJSON Feature (see writePois). It is not the output schema.
 type Point struct {
-	// field names matched to GPX spec
-	Name        string   `json:"name"`
-	Lat         float64  `json:"lat"`
-	Lon         float64  `json:"lon"`
-	Description string   `json:"desc"`
-	Symbol      string   `json:"sym"`
-	Categories  []string `json:"categories"`
-	OSMID       int64    `json:"osmid"`
+	OSMID   int64
+	OSMType string // "node", "way" or "relation"
+	Name    string
+	Lat     float64
+	Lon     float64
+	// Category is the primary category in matcher priority order; the map uses it
+	// to choose an icon. Categories is the full sorted set, used for filtering.
+	Category   string
+	Categories []string
 	// Tags carries the raw OSM tags as structured key/value pairs so downstream
-	// consumers (e.g. the triage UI) can filter on them directly rather than
-	// re-parsing the JSON embedded in Description.
-	Tags map[string]string `json:"tags"`
+	// consumers (e.g. the triage UI) can filter on them directly.
+	Tags map[string]string
+}
+
+// GeoJSON output types (RFC 7946). The CRS is implicitly WGS84 (lon/lat degrees),
+// so no `crs` member is emitted. coordinates are [longitude, latitude].
+type featureCollection struct {
+	Type     string    `json:"type"` // always "FeatureCollection"
+	Features []feature `json:"features"`
+}
+
+type feature struct {
+	Type string `json:"type"` // always "Feature"
+	// ID namespaces the OSM element type with its id (e.g. "node/123"), giving a
+	// stable, collision-free Feature id (node/way/relation ids share a space).
+	ID         string            `json:"id"`
+	Geometry   geometry          `json:"geometry"`
+	Properties featureProperties `json:"properties"`
+}
+
+type geometry struct {
+	Type        string     `json:"type"`        // always "Point"
+	Coordinates [2]float64 `json:"coordinates"` // [longitude, latitude]
+}
+
+type featureProperties struct {
+	Name string `json:"name"`
+	// Category is the primary (priority-ordered) category, used to pick the icon.
+	Category   string            `json:"category"`
+	Categories []string          `json:"categories"`
+	OSMType    string            `json:"osm_type"`
+	OSMID      int64             `json:"osmid"`
+	Tags       map[string]string `json:"tags"`
+}
+
+func geoJSONFeature(p Point) feature {
+	return feature{
+		Type: "Feature",
+		ID:   fmt.Sprintf("%s/%d", p.OSMType, p.OSMID),
+		Geometry: geometry{
+			Type:        "Point",
+			Coordinates: [2]float64{round6(p.Lon), round6(p.Lat)},
+		},
+		Properties: featureProperties{
+			Name:       p.Name,
+			Category:   p.Category,
+			Categories: p.Categories,
+			OSMType:    p.OSMType,
+			OSMID:      p.OSMID,
+			Tags:       p.Tags,
+		},
+	}
+}
+
+// round6 rounds a coordinate to 6 decimal places (~0.1 m), the precision
+// recommended by RFC 7946 §11.2; more digits only inflate the output.
+func round6(f float64) float64 {
+	return math.Round(f*1e6) / 1e6
 }
 
 // workUnit represents a single split's worth of work for the worker pool.
@@ -710,8 +768,8 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 	getPoint, getStats := point(namePrefix)
 
 	pois := make(map[string]Point)
-	addPoint := func(id int64, tags map[string]string, loc LatLon) error {
-		pt, err := getPoint(id, tags, loc)
+	addPoint := func(osmType string, id int64, tags map[string]string, loc LatLon) error {
+		pt, err := getPoint(osmType, id, tags, loc)
 		if err != nil {
 			return fmt.Errorf("getting point for item: %w", err)
 		}
@@ -726,12 +784,12 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 	}
 	for _, result := range results {
 		for _, node := range result.nodes {
-			if err := addPoint(node.ID, node.Tags, LatLon{Lat: node.Lat, Lon: node.Lon}); err != nil {
+			if err := addPoint("node", node.ID, node.Tags, LatLon{Lat: node.Lat, Lon: node.Lon}); err != nil {
 				return fmt.Errorf("adding point for node(%v): %w", node, err)
 			}
 		}
 		for _, wp := range result.wayPoints {
-			if err := addPoint(wp.ID, wp.Tags, wp.Loc); err != nil {
+			if err := addPoint(wp.Type, wp.ID, wp.Tags, wp.Loc); err != nil {
 				return fmt.Errorf("adding point for wayPoint(%v): %w", wp, err)
 			}
 		}
@@ -787,11 +845,8 @@ func writePois(pois map[string]Point, getStats func(topK int) stats, out io.Writ
 			if i.Name != j.Name {
 				return cmp.Compare(i.Name, j.Name)
 			}
-			if i.Description != j.Description {
-				return cmp.Compare(i.Description, j.Description)
-			}
-			if i.Symbol != j.Symbol {
-				return cmp.Compare(i.Symbol, j.Symbol)
+			if i.Category != j.Category {
+				return cmp.Compare(i.Category, j.Category)
 			}
 			if i.Lat != j.Lat {
 				return cmp.Compare(i.Lat, j.Lat)
@@ -802,13 +857,22 @@ func writePois(pois map[string]Point, getStats func(topK int) stats, out io.Writ
 			if comparison := slices.Compare(i.Categories, j.Categories); comparison != 0 {
 				return comparison
 			}
+			if i.OSMType != j.OSMType {
+				return cmp.Compare(i.OSMType, j.OSMType)
+			}
 			return cmp.Compare(i.OSMID, j.OSMID)
 
 		})
+
+	fc := featureCollection{Type: "FeatureCollection", Features: make([]feature, 0, len(sortedPOIs))}
+	for _, p := range sortedPOIs {
+		fc.Features = append(fc.Features, geoJSONFeature(p))
+	}
+
 	encoder := json.NewEncoder(out)
 	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(sortedPOIs); err != nil {
-		return fmt.Errorf("writing output json: %w", err)
+	if err := encoder.Encode(fc); err != nil {
+		return fmt.Errorf("writing output geojson: %w", err)
 	}
 
 	if stats := false; stats {
@@ -867,36 +931,32 @@ func (os occurrences[T]) topK(k int) []valueFreq[T] {
 	return vfs
 }
 
-func point(namePrefix string) (func(id int64, tags map[string]string, latLon LatLon) (Point, error), func(topK int) stats) {
+func point(namePrefix string) (func(osmType string, id int64, tags map[string]string, latLon LatLon) (Point, error), func(topK int) stats) {
 	var totalPoints int
 	tagOccurrences := make(occurrences[string])
 	tagValueOccurrences := make(occurrences[string])
-	return func(id int64, tags map[string]string, latLon LatLon) (Point, error) {
+	return func(osmType string, id int64, tags map[string]string, latLon LatLon) (Point, error) {
 			name, err := resolveName(tags)
 			if err != nil {
 				return Point{}, fmt.Errorf("resolving name from tags(%v): %w", tags, err)
-			}
-			desc, err := json.Marshal(tags)
-			if err != nil {
-				return Point{}, fmt.Errorf("marshalling node tags for description: %w", err)
 			}
 			for tag, value := range tags {
 				tagOccurrences.mark(tag)
 				tagValueOccurrences.mark(tag + ":" + value)
 			}
-			symbol, cats := resolveSymbolAndCategories(tags)
-			if symbol == "" {
-				log.Println("No symbol found for tags", tags)
+			category, cats := resolveCategories(tags)
+			if category == "" {
+				log.Println("No category found for tags", tags)
 			}
 			nodePoint := Point{
-				OSMID:       id,
-				Name:        namePrefix + name,
-				Lat:         latLon.Lat,
-				Lon:         latLon.Lon,
-				Description: string(desc),
-				Symbol:      symbol,
-				Categories:  cats,
-				Tags:        tags,
+				OSMID:      id,
+				OSMType:    osmType,
+				Name:       namePrefix + name,
+				Lat:        latLon.Lat,
+				Lon:        latLon.Lon,
+				Category:   category,
+				Categories: cats,
+				Tags:       tags,
 			}
 			totalPoints++
 			return nodePoint, nil
@@ -969,7 +1029,7 @@ func processWayElement(e element, routePoints []gpxgo.GPXPoint) []wayPoint {
 	if len(e.Geometry) < 2 {
 		// Degenerate way: use the single geometry point if available
 		if len(e.Geometry) == 1 {
-			return []wayPoint{{ID: e.ID, Loc: e.Geometry[0], Tags: e.Tags}}
+			return []wayPoint{{Type: e.Type, ID: e.ID, Loc: e.Geometry[0], Tags: e.Tags}}
 		}
 		return nil
 	}
@@ -978,11 +1038,11 @@ func processWayElement(e element, routePoints []gpxgo.GPXPoint) []wayPoint {
 	if len(crossings) > 0 {
 		var result []wayPoint
 		for _, c := range crossings {
-			result = append(result, wayPoint{ID: e.ID, Loc: c, Tags: e.Tags})
+			result = append(result, wayPoint{Type: e.Type, ID: e.ID, Loc: c, Tags: e.Tags})
 		}
 		return result
 	}
-	return []wayPoint{{ID: e.ID, Loc: closest, Tags: e.Tags}}
+	return []wayPoint{{Type: e.Type, ID: e.ID, Loc: closest, Tags: e.Tags}}
 }
 
 // processRelationElement converts a relation element into wayPoints by
@@ -1022,12 +1082,12 @@ func processRelationElement(e element, routePoints []gpxgo.GPXPoint) []wayPoint 
 		if len(allCrossings) > 0 {
 			var result []wayPoint
 			for _, c := range allCrossings {
-				result = append(result, wayPoint{ID: e.ID, Loc: c, Tags: e.Tags})
+				result = append(result, wayPoint{Type: e.Type, ID: e.ID, Loc: c, Tags: e.Tags})
 			}
 			return result
 		}
 		if globalClosest != nil {
-			return []wayPoint{{ID: e.ID, Loc: *globalClosest, Tags: e.Tags}}
+			return []wayPoint{{Type: e.Type, ID: e.ID, Loc: *globalClosest, Tags: e.Tags}}
 		}
 		return nil
 	}
@@ -1037,6 +1097,7 @@ func processRelationElement(e element, routePoints []gpxgo.GPXPoint) []wayPoint 
 	for _, m := range e.Members {
 		if m.Type == "node" && (m.Lat != 0 || m.Lon != 0) {
 			result = append(result, wayPoint{
+				Type: e.Type,
 				ID:   e.ID,
 				Loc:  LatLon{Lat: m.Lat, Lon: m.Lon},
 				Tags: e.Tags,
@@ -1229,11 +1290,12 @@ func resolveName(tags map[string]string) (string, error) {
 	return "", errors.New("no suitable tag for name")
 }
 
-func resolveSymbolAndCategories(tags map[string]string) (string, []string) {
-	// symbol is meant to be a symbol that make sense on a Garmin GPC
-	// category is meant to be a more fine-grained category for an item
-	var symbols []string
-	var categories []string
+// resolveCategories matches a POI's tags against an ordered list of rules and
+// returns the primary category (the first match in priority order, used to pick
+// the map icon) plus the full sorted set of matched categories (used for
+// filtering). A POI can sit in several categories at once.
+func resolveCategories(tags map[string]string) (primary string, all []string) {
+	var ordered []string // matched categories in rule priority order
 	type matchConfig struct {
 		exact  string
 		any    []string
@@ -1248,35 +1310,43 @@ func resolveSymbolAndCategories(tags map[string]string) (string, []string) {
 		}
 	}
 
-	for _, symbolMatchers := range []struct {
+	for _, rule := range []struct {
 		tags     map[string]matchConfig
-		symbol   string
-		category func(tags map[string]string) string // defaults to symbol if no category given
+		category func(tags map[string]string) string
 	}{
-		{tags: map[string]matchConfig{"shop": {any: []string{"convenience", "supermarket"}}}, symbol: "Shopping Center", category: static("Resupply")},
-		{tags: map[string]matchConfig{"leisure": {exact: "park"}}, symbol: "Park"},
-		{tags: map[string]matchConfig{"boundary": {exact: "protected_area"}}, symbol: "Park"},
-		{tags: map[string]matchConfig{"amenity": {exact: "toilets"}}, symbol: "Restroom", category: static("Toilets")},
-		{tags: map[string]matchConfig{"amenity": {exact: "drinking_water"}}, symbol: "Drinking Water"},
-		{tags: map[string]matchConfig{"man_made": {any: []string{"water_tap", "drinking_fountain"}}}, symbol: "Drinking Water"},
-		{tags: map[string]matchConfig{"drinking_water": {exact: "yes"}}, symbol: "Drinking Water"},
-		{tags: map[string]matchConfig{"amenity": {any: []string{"water_point", "watering_place"}}}, symbol: "Drinking Water"},
-		{tags: map[string]matchConfig{"man_made": {any: []string{"water_well", "spring_box"}}}, symbol: "Water Source"},
-		{tags: map[string]matchConfig{"amenity": {exact: "fountain"}}, symbol: "Drinking Water"},
-		{tags: map[string]matchConfig{"natural": {any: []string{"peak", "saddle"}}}, symbol: "Summit"},
-		{tags: map[string]matchConfig{"mountain_pass": {exact: "yes"}}, symbol: "Summit"},
-		{tags: map[string]matchConfig{"tourism": {exact: "viewpoint"}}, symbol: "Scenic Area", category: static("Viewpoint")},
-		{tags: map[string]matchConfig{"amenity": {exact: "bicycle_repair_station"}}, symbol: "Mine", category: static("Bicycle Repair Station")},
-		{tags: map[string]matchConfig{"amenity": {exact: "fast_food"}}, symbol: "Fast Food", category: static("Restaurant")},
-		{tags: map[string]matchConfig{"amenity": {exact: "fuel"}}, symbol: "Gas Station"},
-		{tags: map[string]matchConfig{"amenity": {any: []string{"pub", "bar"}}}, symbol: "Bar", category: static("Restaurant")},
-		{tags: map[string]matchConfig{"amenity": {exact: "cafe"}}, symbol: "Restaurant"},
-		{tags: map[string]matchConfig{"shop": {exact: "coffee"}}, symbol: "Restaurant"},
-		{tags: map[string]matchConfig{"tourism": {exact: "picnic_site"}}, symbol: "Picnic Area", category: static("Park")},
-		{tags: map[string]matchConfig{"amenity": {exact: "restaurant"}, "cuisine": {exact: "pizza"}}, symbol: "Pizza", category: static("Restaurant")},
-		{tags: map[string]matchConfig{"amenity": {exact: "restaurant"}}, symbol: "Restaurant"},
-		{tags: map[string]matchConfig{"amenity": {exact: "ice_cream"}}, symbol: "Fast Food", category: static("Restaurant")},
-		{tags: map[string]matchConfig{"tourism": {any: []string{"camp_pitch", "camp_site"}}}, symbol: "Campground"},
+		{tags: map[string]matchConfig{"shop": {any: []string{"convenience", "supermarket", "general", "greengrocer", "food", "health_food", "kiosk", "tortilla"}}}, category: static("Resupply")},
+		{tags: map[string]matchConfig{"shop": {any: []string{"bakery", "pastry"}}}, category: static("Bakery")},
+		{tags: map[string]matchConfig{"shop": {any: []string{"dairy", "cheese"}}}, category: static("Dairy")},
+		{tags: map[string]matchConfig{"shop": {exact: "farm"}}, category: static("Farm Shop")},
+		{tags: map[string]matchConfig{"shop": {exact: "ice_cream"}}, category: static("Ice Cream")},
+		{tags: map[string]matchConfig{"shop": {exact: "chemist"}}, category: static("Pharmacy")},
+		{tags: map[string]matchConfig{"shop": {exact: "bicycle"}}, category: static("Bicycle Shop")},
+		{tags: map[string]matchConfig{"shop": {exact: "sports"}}, category: static("Sports Shop")},
+		{tags: map[string]matchConfig{"shop": {exact: "water"}}, category: static("Drinking Water")},
+		{tags: map[string]matchConfig{"leisure": {exact: "park"}}, category: static("Park")},
+		{tags: map[string]matchConfig{"boundary": {exact: "protected_area"}}, category: static("Park")},
+		{tags: map[string]matchConfig{"amenity": {exact: "toilets"}}, category: static("Toilets")},
+		{tags: map[string]matchConfig{"amenity": {exact: "drinking_water"}}, category: static("Drinking Water")},
+		{tags: map[string]matchConfig{"man_made": {any: []string{"water_tap", "drinking_fountain"}}}, category: static("Drinking Water")},
+		{tags: map[string]matchConfig{"drinking_water": {exact: "yes"}}, category: static("Drinking Water")},
+		{tags: map[string]matchConfig{"amenity": {any: []string{"water_point", "watering_place"}}}, category: static("Drinking Water")},
+		{tags: map[string]matchConfig{"man_made": {any: []string{"water_well", "spring_box"}}}, category: static("Water Source")},
+		{tags: map[string]matchConfig{"amenity": {exact: "fountain"}}, category: static("Drinking Water")},
+		{tags: map[string]matchConfig{"natural": {any: []string{"peak", "saddle"}}}, category: static("Summit")},
+		{tags: map[string]matchConfig{"mountain_pass": {exact: "yes"}}, category: static("Summit")},
+		{tags: map[string]matchConfig{"natural": {exact: "mountain_range"}}, category: static("Mountain Range")},
+		{tags: map[string]matchConfig{"tourism": {exact: "viewpoint"}}, category: static("Viewpoint")},
+		{tags: map[string]matchConfig{"amenity": {exact: "bicycle_repair_station"}}, category: static("Bicycle Repair Station")},
+		{tags: map[string]matchConfig{"amenity": {exact: "fast_food"}}, category: static("Restaurant")},
+		{tags: map[string]matchConfig{"amenity": {exact: "fuel"}}, category: static("Gas Station")},
+		{tags: map[string]matchConfig{"amenity": {any: []string{"pub", "bar"}}}, category: static("Restaurant")},
+		{tags: map[string]matchConfig{"amenity": {exact: "cafe"}}, category: static("Restaurant")},
+		{tags: map[string]matchConfig{"shop": {exact: "coffee"}}, category: static("Restaurant")},
+		{tags: map[string]matchConfig{"tourism": {exact: "picnic_site"}}, category: static("Park")},
+		{tags: map[string]matchConfig{"amenity": {exact: "restaurant"}, "cuisine": {exact: "pizza"}}, category: static("Restaurant")},
+		{tags: map[string]matchConfig{"amenity": {exact: "restaurant"}}, category: static("Restaurant")},
+		{tags: map[string]matchConfig{"amenity": {exact: "ice_cream"}}, category: static("Restaurant")},
+		{tags: map[string]matchConfig{"tourism": {any: []string{"camp_pitch", "camp_site"}}}, category: static("Campground")},
 		{tags: map[string]matchConfig{"tourism": {any: []string{
 			"alpine_hut",
 			"guest_house",
@@ -1284,17 +1354,23 @@ func resolveSymbolAndCategories(tags map[string]string) (string, []string) {
 			"hostel",
 			"motel",
 			"wilderness_hut",
-		}}}, symbol: "Building", category: static("Accommodation")},
-		{tags: map[string]matchConfig{"accommodation": {exists: true}}, symbol: "Building", category: static("Accommodation")},
-		{tags: map[string]matchConfig{"leisure": {exact: "nature_reserve"}}, symbol: "Park"},
-		{tags: map[string]matchConfig{"amenity": {exact: "shelter"}}, symbol: "Building", category: static("Shelter")},
-		{tags: map[string]matchConfig{"amenity": {exact: "place_of_worship"}}, symbol: "Church", category: static("Place of Worship")},
-		{tags: map[string]matchConfig{"information": {exact: "visitor_centre"}}, symbol: "Information", category: static("Visitor Centre")},
-		{tags: map[string]matchConfig{"information": {exact: "office"}}, symbol: "Information", category: static("Tourist Office")},
-		{tags: map[string]matchConfig{"place": {any: []string{"town", "village", "hamlet", "city", "neighbourhood"}}}, symbol: "City Hall", category: static("Settlement")},
-		{tags: map[string]matchConfig{"natural": {exact: "spring"}}, symbol: "Water Source"},
-		{tags: map[string]matchConfig{"waterway": {any: []string{"river", "stream", "waterfall", "spring"}}}, symbol: "Water Source"},
-		{tags: map[string]matchConfig{"ford": {exact: "yes"}}, symbol: "Water Source"},
+		}}}, category: static("Accommodation")},
+		{tags: map[string]matchConfig{"accommodation": {exists: true}}, category: static("Accommodation")},
+		{tags: map[string]matchConfig{"leisure": {exact: "nature_reserve"}}, category: static("Park")},
+		{tags: map[string]matchConfig{"amenity": {exact: "shelter"}}, category: static("Shelter")},
+		{tags: map[string]matchConfig{"amenity": {exact: "place_of_worship"}}, category: static("Place of Worship")},
+		{tags: map[string]matchConfig{"information": {exact: "visitor_centre"}}, category: static("Visitor Centre")},
+		{tags: map[string]matchConfig{"information": {exact: "office"}}, category: static("Tourist Office")},
+		{tags: map[string]matchConfig{"place": {any: []string{"town", "village", "hamlet", "city", "neighbourhood"}}}, category: static("Settlement")},
+		{tags: map[string]matchConfig{"natural": {exact: "spring"}}, category: static("Water Source")},
+		{tags: map[string]matchConfig{"waterway": {exact: "spring"}}, category: static("Water Source")},
+		{tags: map[string]matchConfig{"ford": {exact: "yes"}}, category: static("Water Source")},
+		// Flowing watercourses get their own category (rendered with a waves icon),
+		// distinct from point "Water Source" features (springs/wells/fords).
+		// `artificial`/`connector` are NHD flow-path types (US imports) that are
+		// really named creeks/rivers. This rule sits late, so a more specific
+		// category still wins when one matches.
+		{tags: map[string]matchConfig{"waterway": {any: []string{"river", "stream", "waterfall", "artificial", "connector", "rapids", "tidal_channel"}}}, category: static("Waterway")},
 		{tags: map[string]matchConfig{"amenity": {exists: true}}, category: func(tags map[string]string) string {
 			v := tags["amenity"]
 			if len(v) == 0 {
@@ -1307,7 +1383,7 @@ func resolveSymbolAndCategories(tags map[string]string) (string, []string) {
 		}},
 	} {
 		match := true
-		for k, matcher := range symbolMatchers.tags {
+		for k, matcher := range rule.tags {
 			v, ok := tags[k]
 			if !ok {
 				match = false
@@ -1322,33 +1398,22 @@ func resolveSymbolAndCategories(tags map[string]string) (string, []string) {
 			matchedTags[k] = v
 		}
 		if match {
-			if symbolMatchers.symbol != "" {
-				symbols = append(symbols, symbolMatchers.symbol)
-			}
-			if symbolMatchers.category != nil {
-				if category := symbolMatchers.category(matchedTags); category != "" {
-					categories = append(categories, category)
-				}
-			} else if symbolMatchers.symbol != "" {
-				categories = append(categories, symbolMatchers.symbol)
+			if category := rule.category(matchedTags); category != "" {
+				ordered = append(ordered, category)
 			}
 		}
 	}
 
-	// do not sort symbols because they are in priority order
-	// sort and compact to rid of duplicates
-
-	symbols = slices.CompactFunc(symbols, orderRetainingUniqCompact[string]())
-	// do sort categories because they are a set
-	slices.Sort(categories)
-	categories = slices.Compact(categories)
-	if len(symbols) == 0 {
-		return "", categories
+	// ordered is in rule priority order; keep only the first occurrence of each so
+	// the primary is the highest-priority match.
+	ordered = slices.CompactFunc(ordered, orderRetainingUniqCompact[string]())
+	if len(ordered) == 0 {
+		return "", nil
 	}
-	if len(symbols) > 1 {
-		log.Printf("Multiple symbols matched for tags (%v), using first: %v", matchedTags, symbols)
-	}
-	return symbols[0], categories
+	// all is the sorted set used for filtering; primary keeps priority order.
+	all = slices.Clone(ordered)
+	slices.Sort(all)
+	return ordered[0], all
 }
 
 // orderRetainingUniqCompact provides a function to pass to slices.CompactFunc that will compact a slice in a way that
