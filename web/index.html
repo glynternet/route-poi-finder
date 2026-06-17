@@ -166,12 +166,13 @@
           area exists, only POIs inside an include area are kept (minus excludes).</p>
         <label class="check"><input type="checkbox" id="show-removed" /> Show removed POIs (faded)</label>
         <label class="check"><input type="checkbox" id="show-labels" checked /> Show name labels</label>
+        <label class="check"><input type="checkbox" id="show-areas" checked /> Show filter areas</label>
       </section>
 
       <section>
-        <h2>Areas</h2>
+        <h2>Filter areas</h2>
         <ul id="area-list"></ul>
-        <p class="hint" id="no-areas">No areas drawn yet.</p>
+        <p class="hint" id="no-areas">No filter areas drawn yet.</p>
       </section>
 
       <section>
@@ -897,6 +898,17 @@
   }
   document.getElementById("show-labels").addEventListener("change", applyLabelVisibility);
 
+  // Toggle visibility of all drawn include/exclude areas. Purely visual: hiding
+  // them declutters the map but does NOT change filtering — the areas array and
+  // applyFilter() are untouched. All shapes render in areaPane, so flipping that
+  // pane's display hides/shows them in one move without disturbing the layers.
+  function applyAreaVisibility() {
+    const on = document.getElementById("show-areas").checked;
+    map.getPane("areaPane").style.display = on ? "" : "none";
+    saveState();
+  }
+  document.getElementById("show-areas").addEventListener("change", applyAreaVisibility);
+
   // ---------- Tag filter events ----------
   document.getElementById("tag-mode-toggle").addEventListener("click", (e) => {
     const btn = e.target.closest("button");
@@ -975,6 +987,7 @@
       tagMode,
       showRemoved: document.getElementById("show-removed").checked,
       showLabels: document.getElementById("show-labels").checked,
+      showAreas: document.getElementById("show-areas").checked,
     };
   }
 
@@ -1037,6 +1050,10 @@
       if (s.showLabels === false) document.getElementById("show-labels").checked = false;
       document.getElementById("map").classList.toggle(
         "labels-off", !document.getElementById("show-labels").checked);
+      if (s.showAreas === false) {
+        document.getElementById("show-areas").checked = false;
+        map.getPane("areaPane").style.display = "none";
+      }
     } finally {
       restoring = false;
     }
