@@ -21,7 +21,7 @@ type Status struct {
 
 // StatusFetcher returns a function that fetches and parses the current status from the Overpass API
 func StatusFetcher(endpoint string) func() (Status, error) {
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: 20 * time.Second}
 	return func() (Status, error) {
 		req, err := http.NewRequest("GET", endpoint, nil)
 		if err != nil {
