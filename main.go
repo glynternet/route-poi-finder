@@ -1271,6 +1271,7 @@ func resolveName(tags map[string]string) (string, error) {
 		"boundary", // probably good to combine this with another tag
 		"man_made",
 		"drinking_water",
+		"ford", // should actually check that it's not ford:yes
 	} {
 		if n, ok := tags[tag]; ok {
 			return n, nil
