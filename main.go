@@ -533,7 +533,7 @@ func main() {
 		os.Exit(1)
 	}
 	if err := mainErr(args[0], *namePrefix, *split, *workers, *retries, *failFast, *cacheDir, *cacheTTL, *out, endpoints.specs); err != nil {
-		log.Println(err.Error())
+		log.Println("Error:", err.Error())
 		os.Exit(1)
 	}
 	os.Exit(0)
