@@ -2,6 +2,7 @@ package overpass
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,11 +20,14 @@ type Status struct {
 	NextSlotWaits []time.Duration // sorted ascending
 }
 
-// StatusFetcher returns a function that fetches and parses the current status from the Overpass API
-func StatusFetcher(endpoint string) func() (Status, error) {
+// StatusFetcher returns a function that fetches and parses the current status
+// from the Overpass API. The returned function honours the passed context, so a
+// slow status fetch can be aborted (e.g. once work has completed elsewhere)
+// rather than blocking until the HTTP client's own timeout.
+func StatusFetcher(endpoint string) func(ctx context.Context) (Status, error) {
 	client := &http.Client{Timeout: 20 * time.Second}
-	return func() (Status, error) {
-		req, err := http.NewRequest("GET", endpoint, nil)
+	return func(ctx context.Context) (Status, error) {
+		req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
 		if err != nil {
 			return Status{}, fmt.Errorf("creating status request: %w", err)
 		}

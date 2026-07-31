@@ -17,13 +17,14 @@ import (
 type Client struct {
 	interpreterEndpoint string
 	httpClient          *http.Client
-	fetchStatus         func() (Status, error)
+	fetchStatus         func(ctx context.Context) (Status, error)
 
-	tokens    chan struct{}    // buffered channel, cap = rate limit; nil when unlimited
-	requests  chan slotRequest // incoming slot requests
-	done      chan struct{}    // shutdown signal
-	rateLimit int              // cached from initial status fetch; 0 means unlimited
-	unlimited bool             // true when server reports Rate limit: 0
+	tokens      chan struct{}      // buffered channel, cap = rate limit; nil when unlimited
+	requests    chan slotRequest   // incoming slot requests
+	closeCtx    context.Context    // cancelled by Close; drives coordinator shutdown and its status fetches
+	closeCancel context.CancelFunc // cancels closeCtx
+	rateLimit   int                // cached from initial status fetch; 0 means unlimited
+	unlimited   bool               // true when server reports Rate limit: 0
 
 	startOnce sync.Once
 	closeOnce sync.Once
@@ -38,21 +39,27 @@ type slotRequest struct {
 // NewClient creates a new rate-limited Overpass client.
 // Call Start() before using Query().
 func NewClient(interpreterEndpoint, statusEndpoint string, timeout time.Duration) *Client {
+	closeCtx, closeCancel := context.WithCancel(context.Background())
 	return &Client{
 		interpreterEndpoint: interpreterEndpoint,
 		httpClient:          &http.Client{Timeout: timeout},
 		fetchStatus:         StatusFetcher(statusEndpoint),
 		requests:            make(chan slotRequest),
-		done:                make(chan struct{}),
+		closeCtx:            closeCtx,
+		closeCancel:         closeCancel,
 	}
 }
 
 // Start initializes the client by fetching the initial status and starting
 // the coordinator goroutine. It must be called before Query().
+//
+// The passed ctx governs only the initial status fetch: cancelling it aborts a
+// slow fetch so callers waiting to provision this client aren't blocked. The
+// coordinator's lifetime is independent and ends only on Close().
 func (c *Client) Start(ctx context.Context) error {
 	var err error
 	c.startOnce.Do(func() {
-		status, fetchErr := c.fetchStatus()
+		status, fetchErr := c.fetchStatus(ctx)
 		if fetchErr != nil {
 			err = fmt.Errorf("initial status fetch: %w", fetchErr)
 			return
@@ -80,7 +87,7 @@ func (c *Client) Start(ctx context.Context) error {
 			c.tokens <- struct{}{}
 		}
 
-		go c.coordinator(ctx)
+		go c.coordinator()
 
 		if len(status.NextSlotWaits) > 0 {
 			log.Printf("Overpass client started: rate limit=%d, available now=%d, next slot in %s",
@@ -107,7 +114,7 @@ func (c *Client) Unlimited() bool {
 // Close shuts down the client and cancels any pending requests.
 func (c *Client) Close() {
 	c.closeOnce.Do(func() {
-		close(c.done)
+		c.closeCancel()
 	})
 }
 
@@ -121,7 +128,7 @@ func (c *Client) Query(ctx context.Context, query string) (*http.Response, error
 		case c.requests <- slotRequest{ctx: ctx, result: result}:
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-c.done:
+		case <-c.closeCtx.Done():
 			return nil, errors.New("client closed")
 		}
 
@@ -133,7 +140,7 @@ func (c *Client) Query(ctx context.Context, query string) (*http.Response, error
 			}
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-c.done:
+		case <-c.closeCtx.Done():
 			return nil, errors.New("client closed")
 		}
 	}
@@ -155,7 +162,7 @@ func (c *Client) Query(ctx context.Context, query string) (*http.Response, error
 }
 
 // coordinator manages slot allocation and status fetching
-func (c *Client) coordinator(ctx context.Context) {
+func (c *Client) coordinator() {
 	var pendingRequests []slotRequest
 	timerFired := make(chan struct{}, 1)
 	var timerActive bool
@@ -190,7 +197,7 @@ func (c *Client) coordinator(ctx context.Context) {
 				// If no timer running, fetch status now
 				if !timerActive {
 					pendingRequests, timerActive, nextSlotWait, statusRetries = c.fetchStatusAndSchedule(
-						ctx, pendingRequests, timerFired, statusRetries)
+						pendingRequests, timerFired, statusRetries)
 				}
 			}
 
@@ -199,17 +206,10 @@ func (c *Client) coordinator(ctx context.Context) {
 			// Timer fired - fetch fresh status and process
 			if len(pendingRequests) > 0 {
 				pendingRequests, timerActive, nextSlotWait, statusRetries = c.fetchStatusAndSchedule(
-					ctx, pendingRequests, timerFired, statusRetries)
+					pendingRequests, timerFired, statusRetries)
 			}
 
-		case <-ctx.Done():
-			// Cancel all pending requests
-			for _, req := range pendingRequests {
-				req.result <- ctx.Err()
-			}
-			return
-
-		case <-c.done:
+		case <-c.closeCtx.Done():
 			// Cancel all pending requests
 			for _, req := range pendingRequests {
 				req.result <- errors.New("client closed")
@@ -222,13 +222,13 @@ func (c *Client) coordinator(ctx context.Context) {
 // fetchStatusAndSchedule fetches status, serves what it can, and schedules one timer if needed.
 // statusRetries tracks consecutive status fetch failures for exponential backoff.
 func (c *Client) fetchStatusAndSchedule(
-	ctx context.Context,
 	pendingRequests []slotRequest,
 	timerFired chan<- struct{},
 	statusRetries int,
 ) (remaining []slotRequest, timerActive bool, nextWait time.Duration, retries int) {
 	const maxStatusRetries = 3
-	status, err := c.fetchStatus()
+	// closeCtx keeps periodic status fetches bounded by the client's lifetime.
+	status, err := c.fetchStatus(c.closeCtx)
 	if err != nil {
 		if statusRetries < maxStatusRetries {
 			statusRetries++

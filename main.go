@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/glynternet/route-poi-finder/overpass"
@@ -260,34 +261,6 @@ type clientWorkers struct {
 	count  int
 }
 
-// apportionWorkers distributes a target total worker count across clients in
-// proportion to each client's natural budget. The largest-budget client absorbs
-// any rounding remainder. Each client gets at least 1 worker.
-func apportionWorkers(in []clientWorkers, target, totalNatural int) []clientWorkers {
-	if totalNatural <= 0 || target <= 0 {
-		return in
-	}
-	out := make([]clientWorkers, len(in))
-	assigned := 0
-	largest := 0
-	for i, cw := range in {
-		share := (cw.count * target) / totalNatural
-		if share < 1 {
-			share = 1
-		}
-		out[i] = clientWorkers{client: cw.client, count: share}
-		assigned += share
-		if cw.count > in[largest].count {
-			largest = i
-		}
-	}
-	// Hand any rounding remainder to the largest-budget client.
-	if assigned < target {
-		out[largest].count += target - assigned
-	}
-	return out
-}
-
 // retryConfig holds retry settings
 type retryConfig struct {
 	maxRetries int
@@ -362,8 +335,19 @@ func retrier[T any](conf retryConfig) func(ctx context.Context, queryFn func() (
 // using a pool of workers. The processUnit function is called for each unit.
 // If failFast is true, processing stops on the first error.
 // If failFast is false, all errors are collected and returned joined.
+// clientsReady streams clients as each finishes provisioning, so workers begin
+// draining the queue the moment their client is ready rather than waiting for
+// every client to provision. The channel must be closed once no more clients
+// will arrive.
+//
+// ctx/cancel are shared with client provisioning: cancel is called once all
+// units are processed (or on failFast), which aborts any still-in-flight status
+// fetch on a slow server so this returns without waiting for it. The caller
+// owns ctx and must not cancel it until this function returns.
 func concurrentUnitsWorker[Unit any, Result any](
-	workersByClient []clientWorkers,
+	ctx context.Context,
+	cancel context.CancelFunc,
+	clientsReady <-chan clientWorkers,
 	processUnit func(client namedClient, unit Unit) (Result, error),
 	failFast bool,
 ) func(units ...Unit) ([]Result, error) {
@@ -373,55 +357,66 @@ func concurrentUnitsWorker[Unit any, Result any](
 	}
 
 	return func(units ...Unit) ([]Result, error) {
-		jobs := make(chan Unit)
-		results := make(chan resultOrError)
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		var wg sync.WaitGroup
-		for _, cw := range workersByClient {
-			for i := 0; i < cw.count; i++ {
-				wg.Add(1)
-				go func(c namedClient) {
-					defer wg.Done()
-					for unit := range jobs {
-						select {
-						case <-ctx.Done():
-							return
-						default:
-						}
-						result, err := processUnit(c, unit)
-						select {
-						case <-ctx.Done():
-							return
-						case results <- resultOrError{result, err}:
-						}
-					}
-				}(cw.client)
-			}
+		// No work: don't wait on any client. Cancel so in-flight provisioning
+		// unwinds; the caller waits on provisioning before touching shared state.
+		if len(units) == 0 {
+			cancel()
+			return nil, nil
 		}
 
+		// The full set of work is known up front, so pre-fill and close the
+		// queue. Workers that attach later simply drain the buffered channel.
+		jobs := make(chan Unit, len(units))
+		for _, unit := range units {
+			jobs <- unit
+		}
+		close(jobs)
+
+		results := make(chan resultOrError)
+
+		// The launcher starts each client's workers as the client becomes
+		// ready. launcherDone closes once clientsReady is drained, guaranteeing
+		// every workerWg.Add has happened before the closer calls Wait.
+		var workerWg sync.WaitGroup
+		launcherDone := make(chan struct{})
 		go func() {
-			for _, unit := range units {
-				select {
-				case <-ctx.Done():
-					break
-				case jobs <- unit:
+			for cw := range clientsReady {
+				for i := 0; i < cw.count; i++ {
+					workerWg.Add(1)
+					go func(c namedClient) {
+						defer workerWg.Done()
+						for unit := range jobs {
+							select {
+							case <-ctx.Done():
+								return
+							default:
+							}
+							result, err := processUnit(c, unit)
+							select {
+							case <-ctx.Done():
+								return
+							case results <- resultOrError{result, err}:
+							}
+						}
+					}(cw.client)
 				}
 			}
-			close(jobs)
+			close(launcherDone)
 		}()
 
 		go func() {
-			wg.Wait()
+			<-launcherDone
+			workerWg.Wait()
 			close(results)
 		}()
 
 		var allResults []Result
 		var errs []error
 		var firstErr error
+		received := 0
 
 		for r := range results {
+			received++
 			if r.err != nil {
 				if !failFast {
 					errs = append(errs, r.err)
@@ -430,9 +425,17 @@ func concurrentUnitsWorker[Unit any, Result any](
 					cancel()
 					// Continue draining to allow workers to finish
 				}
-				continue
+			} else {
+				allResults = append(allResults, r.result)
 			}
-			allResults = append(allResults, r.result)
+			// Once every unit has a result, no client is still needed. Cancel so
+			// a slow server's in-flight status fetch aborts rather than blocking
+			// our return; without this, results stays open until every
+			// provisioning attempt (including the slow one) completes.
+			if received == len(units) {
+				log.Printf("All %d units processed; cancelling any in-flight provisioning and shutting down", len(units))
+				cancel()
+			}
 		}
 
 		if firstErr != nil {
@@ -639,52 +642,7 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 	}
 
 	ctx := context.Background()
-
-	// Create and start one Overpass client per configured endpoint.
 	const queryTimeout = 180 * time.Second
-	var clients []namedClient
-	var perClientWorkers []clientWorkers
-	for _, ep := range endpoints {
-		c := overpass.NewClient(ep.Interpreter, ep.Status, queryTimeout)
-		if err := c.Start(ctx); err != nil {
-			log.Printf("WARN: starting overpass client %q: %v (skipping)", ep.Name, err)
-			continue
-		}
-		defer c.Close()
-
-		var natural int
-		if c.Unlimited() {
-			natural = ep.Concurrency
-			if natural <= 0 {
-				natural = defaultUnlimitedConcurrency
-			}
-			log.Printf("Overpass server %q ready: unlimited (using concurrency=%d)", ep.Name, natural)
-		} else {
-			natural = c.RateLimit()
-			log.Printf("Overpass server %q ready: rate limit=%d", ep.Name, natural)
-		}
-
-		nc := namedClient{name: ep.Name, client: c}
-		clients = append(clients, nc)
-		perClientWorkers = append(perClientWorkers, clientWorkers{client: nc, count: natural})
-	}
-	if len(clients) == 0 {
-		return fmt.Errorf("no overpass servers available")
-	}
-
-	totalNatural := 0
-	for _, cw := range perClientWorkers {
-		totalNatural += cw.count
-	}
-	if workers == 0 {
-		workers = totalNatural
-		log.Printf("Auto-detected %d workers across %d server(s)", workers, len(perClientWorkers))
-	} else if workers != totalNatural {
-		// Reapportion the user-specified total across clients in proportion to
-		// each client's natural budget. Any remainder goes to the largest budget.
-		perClientWorkers = apportionWorkers(perClientWorkers, workers, totalNatural)
-		log.Printf("Apportioned %d workers across %d server(s)", workers, len(perClientWorkers))
-	}
 
 	f, err := os.Open(file)
 	if err != nil {
@@ -721,6 +679,9 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 	}
 
 	pts := gpx.Tracks[0].Segments[0].Points
+	if len(pts) == 0 {
+		return fmt.Errorf("gpx track segment contains no points")
+	}
 
 	// TODO(glynternet): can use glynternet gpx package here instead
 	chunkSize := len(pts) / int(split)
@@ -747,15 +708,120 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 		})
 	}
 
-	log.Printf("Processing %d splits with %d workers", len(workUnits), workers)
+	log.Printf("Processing %d splits", len(workUnits))
+
+	// poolCtx governs the worker pool and the client provisioning status
+	// fetches. Cancelling it — once all work is drained, or on failFast — aborts
+	// any still-in-flight status fetch on a slow server so the command returns
+	// immediately instead of waiting out that server's status timeout.
+	poolCtx, cancelPool := context.WithCancel(ctx)
+	defer cancelPool()
+
+	// Provision every endpoint concurrently and stream each client to the
+	// worker pool the moment it is ready, so a fast server starts pulling from
+	// the queue without waiting on a slow (or failing) sibling to provision.
+	// budget holds the remaining --workers cap; when set (>0), each client
+	// greedily takes min(its natural budget, remaining) workers on a
+	// first-come basis. When --workers is 0 each client uses its natural budget.
+	budget := int64(workers)
+	clientsReady := make(chan clientWorkers, len(endpoints))
+	var readyMu sync.Mutex
+	var readyClients []namedClient
+	var provisionWg sync.WaitGroup
+	for _, ep := range endpoints {
+		provisionWg.Add(1)
+		go func(ep endpointSpec) {
+			defer provisionWg.Done()
+			c := overpass.NewClient(ep.Interpreter, ep.Status, queryTimeout)
+			if err := c.Start(poolCtx); err != nil {
+				if errors.Is(err, context.Canceled) {
+					// poolCtx was cancelled because the work finished (or
+					// failFast fired) before this server provisioned — not a
+					// real failure, so close it quietly without warning.
+					c.Close()
+					log.Printf("Overpass server %q provisioning cancelled (no longer needed)", ep.Name)
+					return
+				}
+				c.Close()
+				log.Printf("WARN: starting overpass client %q: %v (skipping)", ep.Name, err)
+				return
+			}
+
+			var natural int
+			if c.Unlimited() {
+				natural = ep.Concurrency
+				if natural <= 0 {
+					natural = defaultUnlimitedConcurrency
+				}
+				log.Printf("Overpass server %q ready: unlimited (using concurrency=%d)", ep.Name, natural)
+			} else {
+				natural = c.RateLimit()
+				log.Printf("Overpass server %q ready: rate limit=%d", ep.Name, natural)
+			}
+
+			count := natural
+			if workers > 0 {
+				// Greedily claim up to `natural` from the shared cap.
+				count = 0
+				for {
+					remaining := atomic.LoadInt64(&budget)
+					if remaining <= 0 {
+						break
+					}
+					take := remaining
+					if take > int64(natural) {
+						take = int64(natural)
+					}
+					if atomic.CompareAndSwapInt64(&budget, remaining, remaining-take) {
+						count = int(take)
+						break
+					}
+				}
+			}
+
+			nc := namedClient{name: ep.Name, client: c}
+			readyMu.Lock()
+			readyClients = append(readyClients, nc)
+			readyMu.Unlock()
+
+			// Hand the client to the pool, unless the pool is already shutting
+			// down (all work done, failFast, or no work) — in which case no
+			// worker will consume it. It's recorded in readyClients for cleanup.
+			select {
+			case clientsReady <- clientWorkers{client: nc, count: count}:
+				log.Printf("Overpass server %q starting %d worker(s)", ep.Name, count)
+			case <-poolCtx.Done():
+				log.Printf("Overpass server %q ready but no longer needed", ep.Name)
+			}
+		}(ep)
+	}
+	go func() {
+		provisionWg.Wait()
+		close(clientsReady)
+	}()
+	// readyClients is written by the provisioning goroutines above and read
+	// (and closed) here, so we must wait for them all to finish before touching
+	// it. Deferred close runs at return, after the provisionWg.Wait() below.
+	defer func() {
+		for _, nc := range readyClients {
+			nc.client.Close()
+		}
+	}()
 
 	retryConf := retryConfig{
 		maxRetries: retries,
 		baseDelay:  5 * time.Second,
 		maxDelay:   60 * time.Second,
 	}
-	processUnits := concurrentUnitsWorker(perClientWorkers, unitProcessor(ctx, cacheDir, cacheTTL, retrier[[]element](retryConf), queryTimeout), failFast)
+	processUnits := concurrentUnitsWorker(poolCtx, cancelPool, clientsReady, unitProcessor(ctx, cacheDir, cacheTTL, retrier[[]element](retryConf), queryTimeout), failFast)
 	results, err := processUnits(workUnits...)
+	// Wait for every provisioning goroutine to finish (provisioned, failed, or
+	// cancelled) before reading readyClients — processUnits may return before
+	// they wind down (e.g. no work units, or work finished on another server).
+	provisionWg.Wait()
+	if len(readyClients) == 0 {
+		return fmt.Errorf("no overpass servers available")
+	}
 	if err != nil {
 		return err
 	}
