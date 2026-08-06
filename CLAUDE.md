@@ -39,3 +39,8 @@ Single-file Go CLI tool (`main.go`) that finds Points of Interest along GPS rout
 - `--workers` - Number of concurrent workers for API requests (default 0=auto-detect from API rate limit)
 - `--retries` - Number of retries per API request on transient failures (default 5)
 - `--fail-fast` - Stop processing on first API error (default true, use `--fail-fast=false` to collect all errors)
+
+## Task tracking & commits
+
+- `todos.md` tracks only *open* work. When a task is finished, **remove** its entry — do not leave it marked "done". The durable record of what changed and why lives in the commit that did it, not in `todos.md`.
+- Commit messages should describe both the **what** and the **why** of the change (in addition to the gitmoji and no-Claude-co-author rules in the global config).

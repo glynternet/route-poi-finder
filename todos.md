@@ -144,3 +144,119 @@ It would be great to intoduce a single-flight mechanism, so that if two workers 
 **References:**
 - Go os.CreateTemp for unique temp files: https://pkg.go.dev/os#CreateTemp
 - POSIX file write atomicity: https://pubs.opengroup.org/onlinepubs/9699919799/functions/write.html
+
+---
+
+# Concurrency & Robustness Review (2026-07-31)
+
+Open findings from a two-part red-team review (the concurrent-provisioning work
+and the whole codebase). Listed in the order we intend to tackle them.
+
+## Priority order
+
+1. **[HIGH]** Coordinator can strand a queued slot request → possible hang; fail
+   *all* pending requests (or reschedule) instead of only the oldest.
+2. **[MEDIUM]** Refuse "unlimited" mode unless a real `Rate limit:` line parsed.
+3. **[LOW batch]** Minor hardening in one pass: atomic `--out` write, `--out ""`
+   path logging, retry-shift overflow clamp, ineffective-`break` fix,
+   provisioning-error misreport.
+4. **[DEFERRED]** Split-`Query` refinement so `--workers` counts *executing*
+   units, not units merely committed and waiting out a server's slot cooldown.
+   See the section below.
+
+---
+
+## [HIGH] Coordinator can strand a queued slot request → possible hang
+
+**Files:** `overpass/client.go` (`fetchStatusAndSchedule`: the "no slots + no wait times" and max-status-retries branches; slot wait in `Query`)
+**Type:** Correctness / hang
+**Effort:** Medium
+
+The coordinator can strand a queued slot request: the "no slots + no wait times" branch and the max-status-retries branch fail only `pendingRequests[0]` and schedule no timer, so any other waiting worker blocks with nothing to re-drive it. `poolCtx` cancellation (from failFast/completion) now unblocks such a worker in most cases — but a *lone* stranded worker with no failFast prevents completion, so `poolCtx` never cancels and it can still hang indefinitely.
+
+**Fix:** have the stranding branches fail *all* pending requests (or reschedule a timer) rather than only the oldest. Kept separate from the (already-shipped) query-cancellation work to keep the rate-limit coordinator change isolated and testable.
+
+---
+
+## [MEDIUM] Unparseable status silently becomes "unlimited", bypassing throttling
+
+**Files:** `overpass/status.go:64-70`, `overpass/client.go:74-80`
+**Type:** Robustness
+**Effort:** Small
+
+`parseStatusResponse` leaves `RateLimit` at its zero value when the `Rate limit:` line is absent/unparseable, and `0` is interpreted as "no per-IP rate limit". A 200 response with an unexpected body (maintenance/HTML/proxy interstitial, or an Overpass format change) → `unlimited=true` → `defaultUnlimitedConcurrency` (4) unthrottled workers against a server that may actually be throttling → 429 storm / IP-ban risk.
+
+**Fix:** distinguish "no `Rate limit:` line found" from a genuine `Rate limit: 0`; only enter unlimited mode when the line was actually present and parsed.
+
+---
+
+## [DEFERRED] Split `Query` so `--workers` counts executing units, not committed ones
+
+**Files:** `overpass/client.go` (`Query` / coordinator), `main.go` (worker semaphore acquire)
+**Type:** Efficiency (accuracy of the `--workers` cap)
+**Effort:** Medium
+
+In the redesign a worker holds its global `--workers` slot for the whole `processUnit`, which includes `Client.Query` blocking on the coordinator while a rate-limited server waits out a slot cooldown. So `--workers` currently caps *committed* units (executing **or** waiting for a slot), not strictly *executing* ones. Effect: with `--workers` set **below** total capacity, a worker waiting out a cooldown can briefly keep an idle server from picking up work. It's transient (resolves as cooldowns expire) and never affects correctness or the uncapped default.
+
+To make `--workers` count only executing units, acquire the global slot *after* the client grants a real slot rather than around the whole query — e.g. split `Client.Query` into "acquire slot" and "do request", and take the semaphore between them. That reaches into the overpass client API, so it's deferred as a follow-up rather than bundled into the redesign.
+
+---
+
+## [LOW] Output file write is non-atomic and truncates before success
+
+**File:** `main.go:877`
+**Type:** Robustness
+**Effort:** Small
+
+`os.OpenFile(out, O_TRUNC|O_CREATE|O_WRONLY, 0600)` truncates an existing target at open time; if encoding then fails, the previous contents are already gone. Unlike cache writes, output is not temp-file+rename.
+**Fix:** write to a temp file in the same dir and `os.Rename` into place on success (mirror the cache write path).
+
+---
+
+## [LOW] `--out ""` writes to an unnamed temp file with no path reported
+
+**File:** `main.go:866-873`
+**Type:** UX / silent data loss
+**Effort:** Trivial
+
+The `case "":` branch creates `os.CreateTemp("", "pois-json")` and never logs `f.Name()`, so the output lands somewhere the user can't find. (Default is `"-"`, so only an explicit empty value triggers this.)
+**Fix:** log the temp path, or reject empty `--out`.
+
+---
+
+## [LOW] Retry backoff shift overflows with large `--retries`
+
+**File:** `main.go:305-308`
+**Type:** Robustness
+**Effort:** Trivial
+
+`baseDelay * (1 << (attempt-1))` overflows `time.Duration` (int64 ns) once `attempt` exceeds ~34, producing a negative delay; the `delay > maxDelay` clamp is then false and `time.After(negative)` fires immediately → tight retry spam. Harmless at the default `--retries 5`, but `--retries` is user-settable with only a `>= 0` check.
+**Fix:** clamp the shift/attempt, or compute the delay with saturation.
+
+---
+
+## [LOW] Ineffective `break` in token-refill `select`
+
+**File:** `overpass/client.go:289`
+**Type:** Correctness (latent)
+**Effort:** Trivial
+
+`break` exits the `select`, not the `for`, so on a full token buffer the loop keeps spinning to `AvailableNow`. Harmless today (the buffer is drained immediately before, and `AvailableNow <= rateLimit == cap`), but a malformed oversized `AvailableNow` would spin that many no-op iterations. Flagged by `go vet` (SA4011).
+**Fix:** labeled break or `goto`, matching the drain loop just above it.
+
+---
+
+## [LOW] Provisioning error racing with cancellation is misreported
+
+**File:** `main.go:737`
+**Type:** Cosmetic (logging)
+**Effort:** Trivial
+
+If `poolCtx` is cancelled at nearly the same instant a status fetch fails with a genuine network/HTTP error, `errors.Is(err, context.Canceled)` is false → the code logs `WARN: starting overpass client … (skipping)` instead of the quiet "cancelled (no longer needed)". No wrong outcome — the client is still closed and skipped.
+
+---
+
+## Notes on existing TODOs above
+
+- **"Concurrent cache writes are not protected"**: the file-corruption concern is now mitigated — cache writes are atomic via `os.CreateTemp` + `os.Rename`. The single-flight / dedup-request improvement it also describes remains open.
+- The unbounded `around:` filter the review flagged is already tracked under **"Downsample route points in `around` filter"** above.
