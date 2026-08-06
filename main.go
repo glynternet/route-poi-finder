@@ -22,7 +22,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/glynternet/route-poi-finder/overpass"
@@ -254,11 +253,13 @@ type namedClient struct {
 	client *overpass.Client
 }
 
-// clientWorkers binds a named client to the number of worker goroutines that
-// should pull from the shared jobs channel and run queries through it.
+// clientWorkers binds a named client to its capacity: the number of worker
+// goroutines (concurrent query slots) it offers, which pull from the shared jobs
+// channel and run queries through it. For rate-limited servers this is the rate
+// limit; for unlimited servers it is the configured concurrency.
 type clientWorkers struct {
-	client namedClient
-	count  int
+	client   namedClient
+	capacity int
 }
 
 // retryConfig holds retry settings
@@ -335,21 +336,32 @@ func retrier[T any](conf retryConfig) func(ctx context.Context, queryFn func() (
 // using a pool of workers. The processUnit function is called for each unit.
 // If failFast is true, processing stops on the first error.
 // If failFast is false, all errors are collected and returned joined.
+//
 // clientsReady streams clients as each finishes provisioning, so workers begin
 // draining the queue the moment their client is ready rather than waiting for
 // every client to provision. The channel must be closed once no more clients
-// will arrive.
+// will arrive. Each client contributes `capacity` worker goroutines that pull
+// from the shared jobs queue, so per-client concurrency never exceeds that
+// server's limit and work naturally flows to whichever server has a free worker.
+//
+// workers, when > 0, is a global concurrency cap enforced by a shared semaphore:
+// at most `workers` units run at once across all servers. When 0 there is no
+// extra cap and concurrency is just the sum of the servers' capacities. A worker
+// only takes a semaphore slot once it already holds a unit on its client (the
+// client space is acquired first), so a scarce global slot is never parked while
+// waiting for a free server.
 //
 // ctx/cancel are shared with client provisioning: cancel is called once all
-// units are processed (or on failFast), which aborts any still-in-flight status
-// fetch on a slow server so this returns without waiting for it. The caller
-// owns ctx and must not cancel it until this function returns.
+// units are processed (or on failFast), which aborts still-in-flight queries,
+// retries, slot-waits, and status fetches so this returns without waiting for
+// them. The caller owns ctx and must not cancel it until this function returns.
 func concurrentUnitsWorker[Unit any, Result any](
 	ctx context.Context,
 	cancel context.CancelFunc,
 	clientsReady <-chan clientWorkers,
 	processUnit func(client namedClient, unit Unit) (Result, error),
 	failFast bool,
+	workers int,
 ) func(units ...Unit) ([]Result, error) {
 	type resultOrError struct {
 		result Result
@@ -372,6 +384,13 @@ func concurrentUnitsWorker[Unit any, Result any](
 		}
 		close(jobs)
 
+		// Global concurrency cap. nil when uncapped (workers == 0), in which
+		// case the sum of client capacities is the only limit.
+		var sem chan struct{}
+		if workers > 0 {
+			sem = make(chan struct{}, workers)
+		}
+
 		results := make(chan resultOrError)
 
 		// The launcher starts each client's workers as the client becomes
@@ -381,7 +400,7 @@ func concurrentUnitsWorker[Unit any, Result any](
 		launcherDone := make(chan struct{})
 		go func() {
 			for cw := range clientsReady {
-				for i := 0; i < cw.count; i++ {
+				for i := 0; i < cw.capacity; i++ {
 					workerWg.Add(1)
 					go func(c namedClient) {
 						defer workerWg.Done()
@@ -391,7 +410,19 @@ func concurrentUnitsWorker[Unit any, Result any](
 								return
 							default:
 							}
+							// Client space is already held (this goroutine);
+							// now take a global slot before doing the work.
+							if sem != nil {
+								select {
+								case <-ctx.Done():
+									return
+								case sem <- struct{}{}:
+								}
+							}
 							result, err := processUnit(c, unit)
+							if sem != nil {
+								<-sem
+							}
 							select {
 							case <-ctx.Done():
 								return
@@ -720,10 +751,9 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 	// Provision every endpoint concurrently and stream each client to the
 	// worker pool the moment it is ready, so a fast server starts pulling from
 	// the queue without waiting on a slow (or failing) sibling to provision.
-	// budget holds the remaining --workers cap; when set (>0), each client
-	// greedily takes min(its natural budget, remaining) workers on a
-	// first-come basis. When --workers is 0 each client uses its natural budget.
-	budget := int64(workers)
+	// Each client contributes its full capacity; the pool's global semaphore
+	// (from --workers) caps total concurrency, so there is no per-client
+	// apportioning to do here.
 	clientsReady := make(chan clientWorkers, len(endpoints))
 	var readyMu sync.Mutex
 	var readyClients []namedClient
@@ -759,26 +789,6 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 				log.Printf("Overpass server %q ready: rate limit=%d", ep.Name, natural)
 			}
 
-			count := natural
-			if workers > 0 {
-				// Greedily claim up to `natural` from the shared cap.
-				count = 0
-				for {
-					remaining := atomic.LoadInt64(&budget)
-					if remaining <= 0 {
-						break
-					}
-					take := remaining
-					if take > int64(natural) {
-						take = int64(natural)
-					}
-					if atomic.CompareAndSwapInt64(&budget, remaining, remaining-take) {
-						count = int(take)
-						break
-					}
-				}
-			}
-
 			nc := namedClient{name: ep.Name, client: c}
 			readyMu.Lock()
 			readyClients = append(readyClients, nc)
@@ -788,8 +798,8 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 			// down (all work done, failFast, or no work) — in which case no
 			// worker will consume it. It's recorded in readyClients for cleanup.
 			select {
-			case clientsReady <- clientWorkers{client: nc, count: count}:
-				log.Printf("Overpass server %q starting %d worker(s)", ep.Name, count)
+			case clientsReady <- clientWorkers{client: nc, capacity: natural}:
+				log.Printf("Overpass server %q joining pool with capacity %d", ep.Name, natural)
 			case <-poolCtx.Done():
 				log.Printf("Overpass server %q ready but no longer needed", ep.Name)
 			}
@@ -813,7 +823,10 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 		baseDelay:  5 * time.Second,
 		maxDelay:   60 * time.Second,
 	}
-	processUnits := concurrentUnitsWorker(poolCtx, cancelPool, clientsReady, unitProcessor(ctx, cacheDir, cacheTTL, retrier[[]element](retryConf), queryTimeout), failFast)
+	// unitProcessor runs on poolCtx (not the background ctx) so that queries,
+	// retry backoff, and slot-waits are cancelled on failFast/shutdown rather
+	// than running to completion after the pool has given up.
+	processUnits := concurrentUnitsWorker(poolCtx, cancelPool, clientsReady, unitProcessor(poolCtx, cacheDir, cacheTTL, retrier[[]element](retryConf), queryTimeout), failFast, workers)
 	results, err := processUnits(workUnits...)
 	// Wait for every provisioning goroutine to finish (provisioned, failed, or
 	// cancelled) before reading readyClients — processUnits may return before
