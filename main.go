@@ -1353,6 +1353,9 @@ func resolveName(tags map[string]string) (string, error) {
 		"ford", // should actually check that it's not ford:yes
 	} {
 		if n, ok := tags[tag]; ok {
+			if n == "yes" {
+				continue
+			}
 			return n, nil
 		}
 	}
