@@ -24,6 +24,8 @@ import (
 	"sync"
 	"time"
 
+	// aliased because mainErr binds the parsed file to a local named gpx
+	glyngpx "github.com/glynternet/gpx/pkg/gpx"
 	"github.com/glynternet/route-poi-finder/overpass"
 	gpxgo "github.com/tkrajina/gpxgo/gpx"
 	"golang.org/x/text/cases"
@@ -529,7 +531,7 @@ func main() {
 	// flags have to go before args
 	// TODO(glynternet): use better flags package
 	namePrefix := flag.String(`name-prefix`, ``, `prefix to place in front of all points`)
-	split := flag.Uint(`split`, 5, `number of segments to split track into for querying overpass API`)
+	split := flag.Uint(`split`, 5, `number of chunks to split the route into for querying overpass API`)
 	out := flag.String(`out`, "-", `file to write output to, "-" writes to stdout`)
 	workers := flag.Int(`workers`, 0, `number of concurrent workers for API requests (0=auto-detect from API rate limit)`)
 	retries := flag.Int(`retries`, 5, `number of retries per API request on transient failures`)
@@ -714,21 +716,13 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 		return fmt.Errorf("gpx track segment contains no points")
 	}
 
-	// TODO(glynternet): can use glynternet gpx package here instead
-	chunkSize := len(pts) / int(split)
-	if chunkSize < 1 {
-		chunkSize = 1
-	}
-	var splits [][]gpxgo.GPXPoint
-	for i := 0; i < len(pts); i += chunkSize {
-		end := i + chunkSize
-		if end > len(pts) {
-			end = len(pts)
-		}
-		splits = append(splits, pts[i:end])
-	}
-
 	log.Println("points:", len(pts))
+
+	// No pre-overlap: neighbouring chunks share only their boundary point.
+	splits, err := glyngpx.SplitPoints(pts, split, 0)
+	if err != nil {
+		return fmt.Errorf("splitting route into chunks: %w", err)
+	}
 
 	var workUnits []workUnit
 	for splitI, splitPoints := range splits {

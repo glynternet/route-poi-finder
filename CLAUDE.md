@@ -29,8 +29,11 @@ the Overpass HTTP client, with per-server rate-limit slot handling, lives in `ov
 
 **Processing Flow:**
 1. Parse GPX file (requires exactly one track with one segment, containing at least one point)
-2. Split route points into chunks of `len(points)/--split` (default 5). Integer division means a
-   remainder leaves one extra short chunk, so `--split 5` normally yields 6 chunks, not 5
+2. Split the route into `--split` chunks (default 5) via `gpx.SplitPoints` from
+   `github.com/glynternet/gpx`. Chunks divide the route's **segments**, not its points, so
+   consecutive chunks share a boundary point and every segment lies inside exactly one chunk.
+   Segment counts differ by at most one; a route with fewer segments than `--split` yields one
+   chunk per segment
 3. For each chunk, issue **one** consolidated Overpass union query covering all 18 category
    definitions in `queries.go` (amenities, water, tourism, shops, etc.), each with its own
    `around:` radius (500/1000/2000m, or 80m when unset). So query count tracks chunks, not categories
@@ -44,7 +47,7 @@ the Overpass HTTP client, with per-server rate-limit slot handling, lives in `ov
    logged to stderr, not included in the output
 
 **Key flags:**
-- `--split` - Number of route chunks for API queries (default 5, see caveat above)
+- `--split` - Number of route chunks for API queries (default 5, see the chunking note above)
 - `--name-prefix` - Prefix for all POI names in output
 - `--out` - Output destination (default `-` = stdout; a path writes/truncates that file; empty string writes to a temp file)
 - `--cache-dir` - Cache directory (default `$HOME/.route-poi-finder-state`, or `.route-poi-finder-state` if the home dir can't be determined)
