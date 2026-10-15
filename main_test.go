@@ -1,13 +1,171 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func Test_mainErr_cachedRoute(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		emptyResponse   bool
+		noEndpoints     bool
+		cacheChange     string
+		serverAvailable bool
+		wantStatus      int64
+		wantQueries     int64
+		wantErr         string
+	}{
+		{name: "fully cached offline"},
+		{name: "fully cached without endpoints", noEndpoints: true},
+		{name: "empty cached responses offline", emptyResponse: true},
+		{name: "missing cache offline", cacheChange: "missing", wantStatus: 1, wantErr: "no overpass servers available"},
+		{name: "expired cache offline", cacheChange: "expired", wantStatus: 1, wantErr: "no overpass servers available"},
+		{name: "corrupt cache offline", cacheChange: "corrupt", wantErr: "decoding response body"},
+		{name: "partially cached online", cacheChange: "missing", serverAvailable: true, wantStatus: 1, wantQueries: 1},
+		{name: "expired cache online", cacheChange: "expired", serverAvailable: true, wantStatus: 1, wantQueries: 1},
+	} {
+		for _, failFast := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/failFast=%t", tc.name, failFast), func(t *testing.T) {
+				dir := t.TempDir()
+				route := filepath.Join(dir, "route.gpx")
+				if err := os.WriteFile(route, []byte(`<gpx version="1.1" creator="test"><trk><trkseg>
+<trkpt lat="40.0" lon="-105.0"/>
+<trkpt lat="40.1" lon="-105.1"/>
+<trkpt lat="40.2" lon="-105.2"/>
+</trkseg></trk></gpx>`), 0600); err != nil {
+					t.Fatal(err)
+				}
+				var available atomic.Bool
+				available.Store(true)
+				var statusRequests, queryRequests atomic.Int64
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					switch r.URL.Path {
+					case "/status":
+						statusRequests.Add(1)
+					case "/interpreter":
+						queryRequests.Add(1)
+					default:
+						t.Errorf("unexpected request: %s", r.URL.Path)
+						http.NotFound(w, r)
+						return
+					}
+					if !available.Load() {
+						http.Error(w, "unavailable", http.StatusServiceUnavailable)
+						return
+					}
+					content := `{"elements":[]}`
+					if r.URL.Path == "/status" {
+						content = "Rate limit: 0\n"
+					} else if !tc.emptyResponse {
+						// Each split returns a distinct POI, so mixed cache/API
+						// output must retain both sources to match the warm run.
+						id := 1
+						if strings.Contains(r.FormValue("data"), "40.000000,-105.000000") {
+							id = 2
+						}
+						content = fmt.Sprintf(`{"elements":[{"type":"node","id":%d,"lat":40.1,"lon":-105.1,"tags":{"name":"Water","amenity":"drinking_water"}}]}`, id)
+					}
+					if _, err := fmt.Fprint(w, content); err != nil {
+						t.Errorf("writing test response: %v", err)
+					}
+				}))
+				defer server.Close()
+				endpoints := []endpointSpec{{Name: "test", Interpreter: server.URL + "/interpreter", Status: server.URL + "/status"}}
+				cacheDir := filepath.Join(dir, "cache")
+				warmOutput := filepath.Join(dir, "warm.geojson")
+				if err := mainErr(route, "", 2, 1, 0, failFast, cacheDir, time.Hour, warmOutput, endpoints); err != nil {
+					t.Fatalf("populating cache: %v", err)
+				}
+				if got := queryRequests.Load(); got != 2 {
+					t.Fatalf("cache population made %d queries, want 2", got)
+				}
+				warmData, err := os.ReadFile(warmOutput)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var fc featureCollection
+				if err := json.Unmarshal(warmData, &fc); err != nil {
+					t.Fatal(err)
+				}
+				wantFeatures := 2
+				if tc.emptyResponse {
+					wantFeatures = 0
+				}
+				if fc.Type != "FeatureCollection" || len(fc.Features) != wantFeatures {
+					t.Fatalf("unexpected initial output: %s", warmData)
+				}
+
+				entries, err := os.ReadDir(cacheDir)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(entries) != 2 {
+					t.Fatalf("got %d cache entries, want 2", len(entries))
+				}
+				cachePath := filepath.Join(cacheDir, entries[0].Name())
+				switch tc.cacheChange {
+				case "missing":
+					err = os.Remove(cachePath)
+				case "expired":
+					old := time.Now().Add(-2 * time.Hour)
+					err = os.Chtimes(cachePath, old, old)
+				case "corrupt":
+					err = os.WriteFile(cachePath, []byte("{"), 0600)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				available.Store(tc.serverAvailable)
+				statusRequests.Store(0)
+				queryRequests.Store(0)
+				output := filepath.Join(dir, "result.geojson")
+				if tc.noEndpoints {
+					endpoints = nil
+				}
+				err = mainErr(route, "", 2, 1, 0, failFast, cacheDir, time.Hour, output, endpoints)
+				if tc.wantErr != "" {
+					if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+						t.Fatalf("got error %v, want %q", err, tc.wantErr)
+					}
+					if _, err := os.Stat(output); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("failed run should not create output; stat error: %v", err)
+					}
+				} else {
+					if err != nil {
+						t.Fatalf("processing cached route: %v", err)
+					}
+					data, err := os.ReadFile(output)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !bytes.Equal(data, warmData) {
+						t.Fatalf("output changed after caching:\ngot: %s\nwant: %s", data, warmData)
+					}
+				}
+				if got := statusRequests.Load(); got != tc.wantStatus {
+					t.Errorf("got %d status requests, want %d", got, tc.wantStatus)
+				}
+				if got := queryRequests.Load(); got != tc.wantQueries {
+					t.Errorf("got %d interpreter requests, want %d", got, tc.wantQueries)
+				}
+			})
+		}
+	}
+}
 
 func Test_orderRetainingUniqCompact(t *testing.T) {
 	actual := slices.CompactFunc([]string{"a", "a", "b", "c", "a", "b", "b"}, orderRetainingUniqCompact[string]())

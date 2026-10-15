@@ -3,8 +3,6 @@ package main
 import (
 	"cmp"
 	"context"
-	"crypto/sha1"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -13,20 +11,16 @@ import (
 	"log"
 	"maps"
 	"math"
-	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	// aliased because mainErr binds the parsed file to a local named gpx
 	glyngpx "github.com/glynternet/gpx/pkg/gpx"
-	"github.com/glynternet/route-poi-finder/overpass"
 	gpxgo "github.com/tkrajina/gpxgo/gpx"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
@@ -248,284 +242,6 @@ func defaultEndpoints() []endpointSpec {
 	}
 }
 
-// namedClient pairs an Overpass client with the human-readable endpoint name
-// used for logging which server handled which split.
-type namedClient struct {
-	name   string
-	client *overpass.Client
-}
-
-// clientWorkers binds a named client to its capacity: the number of worker
-// goroutines (concurrent query slots) it offers, which pull from the shared jobs
-// channel and run queries through it. For rate-limited servers this is the rate
-// limit; for unlimited servers it is the configured concurrency.
-type clientWorkers struct {
-	client   namedClient
-	capacity int
-}
-
-// retryConfig holds retry settings
-type retryConfig struct {
-	maxRetries int
-	baseDelay  time.Duration
-	maxDelay   time.Duration
-}
-
-// httpStatusError wraps HTTP status code errors for retry logic
-type httpStatusError struct {
-	statusCode int
-	status     string
-}
-
-func (e *httpStatusError) Error() string {
-	return fmt.Sprintf("unexpected status code %d (%s)", e.statusCode, e.status)
-}
-
-// isRetryableError determines if an error should trigger a retry
-func isRetryableError(err error) bool {
-	// Network errors are retryable
-	var netErr net.Error
-	if errors.As(err, &netErr) {
-		return true
-	}
-
-	// Check for HTTP status code errors
-	var httpErr *httpStatusError
-	if errors.As(err, &httpErr) {
-		return httpErr.statusCode >= 500 || httpErr.statusCode == 429
-	}
-
-	return false
-}
-
-func retrier[T any](conf retryConfig) func(ctx context.Context, queryFn func() (T, error)) (T, error) {
-	return func(ctx context.Context, queryFn func() (T, error)) (T, error) {
-		var result T
-		var lastErr error
-
-		for attempt := 0; attempt <= conf.maxRetries; attempt++ {
-			if attempt > 0 {
-				delay := conf.baseDelay * time.Duration(1<<(attempt-1))
-				if delay > conf.maxDelay {
-					delay = conf.maxDelay
-				}
-
-				select {
-				case <-ctx.Done():
-					return result, ctx.Err()
-				case <-time.After(delay):
-				}
-
-				log.Printf("Retry attempt %d/%d after error: %v", attempt, conf.maxRetries, lastErr)
-			}
-
-			result, lastErr = queryFn()
-			if lastErr == nil {
-				return result, nil
-			}
-
-			// Only retry on transient errors
-			if !isRetryableError(lastErr) {
-				return result, lastErr
-			}
-		}
-
-		return result, fmt.Errorf("max retries (%d) exceeded: %w", conf.maxRetries, lastErr)
-	}
-}
-
-// concurrentUnitsWorker returns a function that processes units concurrently
-// using a pool of workers. The processUnit function is called for each unit.
-// If failFast is true, processing stops on the first error.
-// If failFast is false, all errors are collected and returned joined.
-//
-// clientsReady streams clients as each finishes provisioning, so workers begin
-// draining the queue the moment their client is ready rather than waiting for
-// every client to provision. The channel must be closed once no more clients
-// will arrive. Each client contributes `capacity` worker goroutines that pull
-// from the shared jobs queue, so per-client concurrency never exceeds that
-// server's limit and work naturally flows to whichever server has a free worker.
-//
-// workers, when > 0, is a global concurrency cap enforced by a shared semaphore:
-// at most `workers` units run at once across all servers. When 0 there is no
-// extra cap and concurrency is just the sum of the servers' capacities. A worker
-// only takes a semaphore slot once it already holds a unit on its client (the
-// client space is acquired first), so a scarce global slot is never parked while
-// waiting for a free server.
-//
-// ctx/cancel are shared with client provisioning: cancel is called once all
-// units are processed (or on failFast), which aborts still-in-flight queries,
-// retries, slot-waits, and status fetches so this returns without waiting for
-// them. The caller owns ctx and must not cancel it until this function returns.
-func concurrentUnitsWorker[Unit any, Result any](
-	ctx context.Context,
-	cancel context.CancelFunc,
-	clientsReady <-chan clientWorkers,
-	processUnit func(client namedClient, unit Unit) (Result, error),
-	failFast bool,
-	workers int,
-) func(units ...Unit) ([]Result, error) {
-	type resultOrError struct {
-		result Result
-		err    error
-	}
-
-	return func(units ...Unit) ([]Result, error) {
-		// No work: don't wait on any client. Cancel so in-flight provisioning
-		// unwinds; the caller waits on provisioning before touching shared state.
-		if len(units) == 0 {
-			cancel()
-			return nil, nil
-		}
-
-		// The full set of work is known up front, so pre-fill and close the
-		// queue. Workers that attach later simply drain the buffered channel.
-		jobs := make(chan Unit, len(units))
-		for _, unit := range units {
-			jobs <- unit
-		}
-		close(jobs)
-
-		// Global concurrency cap. nil when uncapped (workers == 0), in which
-		// case the sum of client capacities is the only limit.
-		var sem chan struct{}
-		if workers > 0 {
-			sem = make(chan struct{}, workers)
-		}
-
-		results := make(chan resultOrError)
-
-		// The launcher starts each client's workers as the client becomes
-		// ready. launcherDone closes once clientsReady is drained, guaranteeing
-		// every workerWg.Add has happened before the closer calls Wait.
-		var workerWg sync.WaitGroup
-		launcherDone := make(chan struct{})
-		go func() {
-			for cw := range clientsReady {
-				for i := 0; i < cw.capacity; i++ {
-					workerWg.Add(1)
-					go func(c namedClient) {
-						defer workerWg.Done()
-						for unit := range jobs {
-							select {
-							case <-ctx.Done():
-								return
-							default:
-							}
-							// Client space is already held (this goroutine);
-							// now take a global slot before doing the work.
-							if sem != nil {
-								select {
-								case <-ctx.Done():
-									return
-								case sem <- struct{}{}:
-								}
-							}
-							result, err := processUnit(c, unit)
-							if sem != nil {
-								<-sem
-							}
-							select {
-							case <-ctx.Done():
-								return
-							case results <- resultOrError{result, err}:
-							}
-						}
-					}(cw.client)
-				}
-			}
-			close(launcherDone)
-		}()
-
-		go func() {
-			<-launcherDone
-			workerWg.Wait()
-			close(results)
-		}()
-
-		var allResults []Result
-		var errs []error
-		var firstErr error
-		received := 0
-
-		for r := range results {
-			received++
-			if r.err != nil {
-				if !failFast {
-					errs = append(errs, r.err)
-				} else if firstErr == nil {
-					firstErr = r.err
-					cancel()
-					// Continue draining to allow workers to finish
-				}
-			} else {
-				allResults = append(allResults, r.result)
-			}
-			// Once every unit has a result, no client is still needed. Cancel so
-			// a slow server's in-flight status fetch aborts rather than blocking
-			// our return; without this, results stays open until every
-			// provisioning attempt (including the slow one) completes.
-			if received == len(units) {
-				log.Printf("All %d units processed; cancelling any in-flight provisioning and shutting down", len(units))
-				cancel()
-			}
-		}
-
-		if firstErr != nil {
-			return allResults, firstErr
-		}
-		return allResults, errors.Join(errs...)
-	}
-}
-
-// unitProcessor returns a function that processes a single split by building
-// a consolidated Overpass union query across all categories, executing it via
-// queryResponseElementsRaw, and separating nodes from ways in the response.
-func unitProcessor(
-	ctx context.Context,
-	cacheDir string,
-	cacheTTL time.Duration,
-	queryElementsWithRetry func(ctx context.Context, queryFn func() ([]element, error)) ([]element, error),
-	queryTimeout time.Duration,
-) func(c namedClient, unit workUnit) (workResult, error) {
-	return func(c namedClient, unit workUnit) (workResult, error) {
-		log.Printf("Worker [%s] processing split %d", c.name, unit.splitIndex+1)
-
-		renderedQuery, err := renderUnionQuery(unit.queries, unit.routePoints, queryTimeout)
-		if err != nil {
-			return workResult{}, fmt.Errorf("split %d: rendering union query: %w", unit.splitIndex+1, err)
-		}
-
-		elements, err := queryElementsWithRetry(ctx, func() ([]element, error) {
-			return queryResponseElementsRaw(ctx, cacheDir, cacheTTL, c.client.Query, renderedQuery)
-		})
-		if err != nil {
-			return workResult{}, fmt.Errorf("split %d [%s]: querying elements: %w", unit.splitIndex+1, c.name, err)
-		}
-
-		var nodeElements []element
-		var wps []wayPoint
-		for _, e := range elements {
-			switch e.Type {
-			case "node":
-				nodeElements = append(nodeElements, e)
-			case "way":
-				wps = append(wps, processWayElement(e, unit.routePoints)...)
-			case "relation":
-				wps = append(wps, processRelationElement(e, unit.routePoints)...)
-			}
-		}
-
-		log.Printf("Split %d: %d nodes, %d way points", unit.splitIndex+1, len(nodeElements), len(wps))
-
-		return workResult{
-			splitIndex: unit.splitIndex,
-			nodes:      nodeElements,
-			wayPoints:  wps,
-		}, nil
-	}
-}
-
 func main() {
 	log.SetFlags(log.Ldate | log.Lmicroseconds | log.Lshortfile)
 	// flags have to go before args
@@ -670,9 +386,6 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 	if split == 0 {
 		return fmt.Errorf("--split must be greater than 0")
 	}
-	if len(endpoints) == 0 {
-		return fmt.Errorf("no overpass endpoints configured")
-	}
 
 	ctx := context.Background()
 	const queryTimeout = 180 * time.Second
@@ -735,100 +448,21 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 
 	log.Printf("Processing %d splits", len(workUnits))
 
-	// poolCtx governs the worker pool and the client provisioning status
-	// fetches. Cancelling it — once all work is drained, or on failFast — aborts
-	// any still-in-flight status fetch on a slow server so the command returns
-	// immediately instead of waiting out that server's status timeout.
-	poolCtx, cancelPool := context.WithCancel(ctx)
-	defer cancelPool()
-
-	// Provision every endpoint concurrently and stream each client to the
-	// worker pool the moment it is ready, so a fast server starts pulling from
-	// the queue without waiting on a slow (or failing) sibling to provision.
-	// Each client contributes its full capacity; the pool's global semaphore
-	// (from --workers) caps total concurrency, so there is no per-client
-	// apportioning to do here.
-	clientsReady := make(chan clientWorkers, len(endpoints))
-	var readyMu sync.Mutex
-	var readyClients []namedClient
-	var provisionWg sync.WaitGroup
-	for _, ep := range endpoints {
-		provisionWg.Add(1)
-		go func(ep endpointSpec) {
-			defer provisionWg.Done()
-			c := overpass.NewClient(ep.Interpreter, ep.Status, queryTimeout)
-			if err := c.Start(poolCtx); err != nil {
-				if errors.Is(err, context.Canceled) {
-					// poolCtx was cancelled because the work finished (or
-					// failFast fired) before this server provisioned — not a
-					// real failure, so close it quietly without warning.
-					c.Close()
-					log.Printf("Overpass server %q provisioning cancelled (no longer needed)", ep.Name)
-					return
-				}
-				c.Close()
-				log.Printf("WARN: starting overpass client %q: %v (skipping)", ep.Name, err)
-				return
-			}
-
-			var natural int
-			if c.Unlimited() {
-				natural = ep.Concurrency
-				if natural <= 0 {
-					natural = defaultUnlimitedConcurrency
-				}
-				log.Printf("Overpass server %q ready: unlimited (using concurrency=%d)", ep.Name, natural)
-			} else {
-				natural = c.RateLimit()
-				log.Printf("Overpass server %q ready: rate limit=%d", ep.Name, natural)
-			}
-
-			nc := namedClient{name: ep.Name, client: c}
-			readyMu.Lock()
-			readyClients = append(readyClients, nc)
-			readyMu.Unlock()
-
-			// Hand the client to the pool, unless the pool is already shutting
-			// down (all work done, failFast, or no work) — in which case no
-			// worker will consume it. It's recorded in readyClients for cleanup.
-			select {
-			case clientsReady <- clientWorkers{client: nc, capacity: natural}:
-				log.Printf("Overpass server %q joining pool with capacity %d", ep.Name, natural)
-			case <-poolCtx.Done():
-				log.Printf("Overpass server %q ready but no longer needed", ep.Name)
-			}
-		}(ep)
+	orchestrator := queryOrchestrator{
+		cache:        fileQueryCache{dir: cacheDir, ttl: cacheTTL},
+		queryTimeout: queryTimeout,
+		retry: retryConfig{
+			maxRetries: retries,
+			baseDelay:  5 * time.Second,
+			maxDelay:   60 * time.Second,
+		},
+		failFast: failFast,
+		workers:  workers,
+		startClients: func(ctx context.Context) (<-chan clientWorkers, func()) {
+			return provisionClients(ctx, endpoints, queryTimeout)
+		},
 	}
-	go func() {
-		provisionWg.Wait()
-		close(clientsReady)
-	}()
-	// readyClients is written by the provisioning goroutines above and read
-	// (and closed) here, so we must wait for them all to finish before touching
-	// it. Deferred close runs at return, after the provisionWg.Wait() below.
-	defer func() {
-		for _, nc := range readyClients {
-			nc.client.Close()
-		}
-	}()
-
-	retryConf := retryConfig{
-		maxRetries: retries,
-		baseDelay:  5 * time.Second,
-		maxDelay:   60 * time.Second,
-	}
-	// unitProcessor runs on poolCtx (not the background ctx) so that queries,
-	// retry backoff, and slot-waits are cancelled on failFast/shutdown rather
-	// than running to completion after the pool has given up.
-	processUnits := concurrentUnitsWorker(poolCtx, cancelPool, clientsReady, unitProcessor(poolCtx, cacheDir, cacheTTL, retrier[[]element](retryConf), queryTimeout), failFast, workers)
-	results, err := processUnits(workUnits...)
-	// Wait for every provisioning goroutine to finish (provisioned, failed, or
-	// cancelled) before reading readyClients — processUnits may return before
-	// they wind down (e.g. no work units, or work finished on another server).
-	provisionWg.Wait()
-	if len(readyClients) == 0 {
-		return fmt.Errorf("no overpass servers available")
-	}
+	results, err := orchestrator.Run(ctx, workUnits)
 	if err != nil {
 		return err
 	}
@@ -1231,101 +865,6 @@ func renderConditionFilters(conditions []condition) (string, error) {
 		}
 	}
 	return sb.String(), nil
-}
-
-// queryResponseElementsRaw takes a pre-rendered Overpass query string and handles
-// caching, API execution, and JSON parsing of the response.
-func queryResponseElementsRaw(
-	ctx context.Context,
-	cacheDir string,
-	cacheTTL time.Duration,
-	makeQueryRequest func(ctx context.Context, query string) (*http.Response, error),
-	renderedQuery string,
-) ([]element, error) {
-	hasher := sha1.New()
-	if _, err := hasher.Write([]byte(renderedQuery)); err != nil {
-		return nil, fmt.Errorf("hashing query: %w", err)
-	}
-	sha := base64.URLEncoding.EncodeToString(hasher.Sum(nil))
-
-	var rc io.ReadCloser
-	queryStateFilePath := filepath.Join(cacheDir, sha)
-	if info, err := os.Stat(queryStateFilePath); err == nil {
-		if time.Since(info.ModTime()) > cacheTTL {
-			log.Printf("cache expired (age %s > ttl %s): %s",
-				time.Since(info.ModTime()).Round(time.Second), cacheTTL, renderedQuery[:min(80, len(renderedQuery))])
-		} else {
-			stored, err := os.Open(queryStateFilePath)
-			if err != nil {
-				return nil, fmt.Errorf("opening cached query state file(%s): %w", queryStateFilePath, err)
-			}
-			if debug {
-				log.Printf("query fetched from cached result: %s", queryStateFilePath)
-			}
-			rc = stored
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("checking cache file(%s): %w", queryStateFilePath, err)
-	}
-
-	if rc == nil {
-		log.Printf("query result not cached, making query to API: %s", renderedQuery[:min(80, len(renderedQuery))])
-		resp, err := makeQueryRequest(ctx, renderedQuery)
-		if err != nil {
-			return nil, fmt.Errorf("posting query: %w", err)
-		}
-		if resp.StatusCode != http.StatusOK {
-			_ = resp.Body.Close()
-			return nil, &httpStatusError{statusCode: resp.StatusCode, status: resp.Status}
-		}
-		if err := atomicSlurp(cacheDir, resp.Body, queryStateFilePath); err != nil {
-			_ = resp.Body.Close()
-			return nil, fmt.Errorf("storing content into cache: %w", err)
-		}
-		if err := resp.Body.Close(); err != nil {
-			return nil, fmt.Errorf("closing response body: %w", err)
-		}
-
-		if debug {
-			log.Printf("query result written: %s", queryStateFilePath)
-		}
-		stored, err := os.Open(queryStateFilePath)
-		if err != nil {
-			return nil, fmt.Errorf("opening cached result after write: %w", err)
-		}
-		rc = stored
-	}
-
-	var r response
-	if err := json.NewDecoder(rc).Decode(&r); err != nil {
-		_ = rc.Close()
-		return nil, fmt.Errorf("decoding response body: %w", err)
-	}
-	if err := rc.Close(); err != nil {
-		return nil, fmt.Errorf("closing response body: %w", err)
-	}
-	return r.Elements, nil
-}
-
-func atomicSlurp(cacheDir string, resp io.Reader, path string) error {
-	tmpFile, err := os.CreateTemp(cacheDir, ".tmp-*")
-	if err != nil {
-		return fmt.Errorf("creating temp file for cache write: %w", err)
-	}
-	if _, err := io.Copy(tmpFile, resp); err != nil {
-		_ = tmpFile.Close()
-		_ = os.Remove(tmpFile.Name())
-		return fmt.Errorf("writing response body to temp file: %w", err)
-	}
-	if err := tmpFile.Close(); err != nil {
-		_ = os.Remove(tmpFile.Name())
-		return fmt.Errorf("closing temp file: %w", err)
-	}
-	if err := os.Rename(tmpFile.Name(), path); err != nil {
-		_ = os.Remove(tmpFile.Name())
-		return fmt.Errorf("renaming temp file to cache path: %w", err)
-	}
-	return nil
 }
 
 func resolveName(tags map[string]string) (string, error) {

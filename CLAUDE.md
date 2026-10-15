@@ -24,8 +24,10 @@ go test -run TestName -v   # Single test
 ## Architecture
 
 Go CLI tool that finds Points of Interest along GPS routes. `package main` is split across
-`main.go` (everything but the query definitions) and `queries.go` (the POI query definitions);
-the Overpass HTTP client, with per-server rate-limit slot handling, lives in `overpass/`.
+`main.go` (CLI, route geometry, and output), `queries.go` (the POI query definitions),
+`orchestrator.go` (query preparation, cache routing, client registration, and workers), and
+`cache.go` (disk response cache). The Overpass HTTP client, with per-server rate-limit slot
+handling, lives in `overpass/`.
 
 **Processing Flow:**
 1. Parse GPX file (requires exactly one track with one segment, containing at least one point)
@@ -34,12 +36,15 @@ the Overpass HTTP client, with per-server rate-limit slot handling, lives in `ov
    consecutive chunks share a boundary point and every segment lies inside exactly one chunk.
    Segment counts differ by at most one; a route with fewer segments than `--split` yields one
    chunk per segment
-3. For each chunk, issue **one** consolidated Overpass union query covering all 18 category
+3. For each chunk, prepare **one** consolidated Overpass union query covering all 18 category
    definitions in `queries.go` (amenities, water, tourism, shops, etc.), each with its own
    `around:` radius (500/1000/2000m, or 80m when unset). So query count tracks chunks, not categories
-4. Cache API responses in `--cache-dir` (default `$HOME/.route-poi-finder-state`, so the cache
-   persists across reboots), keyed by base64url-encoded SHA1 of the rendered query. Entries older
-   than `--cache-ttl` are re-queried; younger ones are replayed from disk
+4. Look up each prepared query in `--cache-dir` (default `$HOME/.route-poi-finder-state`, so the
+   cache persists across reboots), keyed by base64url-encoded SHA1 of the rendered query.
+   Replay fresh entries from disk and queue only missing or expired entries for API requests.
+   If there are queued queries, provision clients concurrently; each registers its worker
+   capacity as soon as it is ready. Workers execute prepared queries and cache the responses.
+   Fully cached routes complete without starting clients or contacting any servers
 5. Extract nodes; for ways/relations, use the points where their geometry crosses the route,
    falling back to the closest approach point when there is no crossing
 6. Write a GeoJSON `FeatureCollection` (Point features with `name`/`category`/`categories`/
