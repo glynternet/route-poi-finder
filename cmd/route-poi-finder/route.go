@@ -5,21 +5,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"log"
 	"maps"
 	"math"
 	"os"
-	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	// aliased because mainErr binds the parsed file to a local named gpx
+	// aliased because runRoute binds the parsed file to a local named gpx
 	glyngpx "github.com/glynternet/gpx/pkg/gpx"
 	gpxgo "github.com/tkrajina/gpxgo/gpx"
 	"golang.org/x/text/cases"
@@ -187,7 +185,7 @@ type endpointSpec struct {
 	Concurrency int // used only for unlimited servers; 0 means use default
 }
 
-// endpointFlag implements flag.Value for repeatable --overpass-endpoint.
+// endpointFlag implements pflag.Value for repeatable --overpass-endpoint.
 // Each value is NAME=INTERPRETER_URL,STATUS_URL[,CONCURRENCY].
 type endpointFlag struct {
 	specs []endpointSpec
@@ -240,55 +238,6 @@ func defaultEndpoints() []endpointSpec {
 			Concurrency: defaultUnlimitedConcurrency,
 		},
 	}
-}
-
-func main() {
-	log.SetFlags(log.Ldate | log.Lmicroseconds | log.Lshortfile)
-	// flags have to go before args
-	// TODO(glynternet): use better flags package
-	namePrefix := flag.String(`name-prefix`, ``, `prefix to place in front of all points`)
-	split := flag.Uint(`split`, 5, `number of chunks to split the route into for querying overpass API`)
-	out := flag.String(`out`, "-", `file to write output to, "-" writes to stdout`)
-	workers := flag.Int(`workers`, 0, `number of concurrent workers for API requests (0=auto-detect from API rate limit)`)
-	retries := flag.Int(`retries`, 5, `number of retries per API request on transient failures`)
-	failFast := flag.Bool(`fail-fast`, true, `stop processing on first API error`)
-
-	var defaultCacheDir string
-	if homeDir, err := os.UserHomeDir(); err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "Unable to determine home directory for default cache directory: %v\n", err)
-		defaultCacheDir = ".route-poi-finder-state"
-	} else {
-		defaultCacheDir = filepath.Join(homeDir, `.route-poi-finder-state`)
-	}
-	cacheDir := flag.String(`cache-dir`, defaultCacheDir, `directory to cache results in`)
-	cacheTTL := flag.Duration(`cache-ttl`, 28*24*time.Hour, `maximum age of cached API responses before re-querying`)
-	var endpoints endpointFlag
-	flag.Var(&endpoints, `overpass-endpoint`, `Overpass server as NAME=INTERPRETER_URL,STATUS_URL[,CONCURRENCY] (repeatable). CONCURRENCY only used when the server reports unlimited rate. If unset, defaults to overpass-api.de and overpass.private.coffee.`)
-	flag.Parse()
-
-	if !endpoints.set {
-		endpoints.specs = defaultEndpoints()
-	}
-
-	if *workers < 0 {
-		log.Println("--workers must be at least 0")
-		os.Exit(1)
-	}
-	if *retries < 0 {
-		log.Println("--retries must be at least 0")
-		os.Exit(1)
-	}
-
-	args := flag.Args()
-	if len(args) != 1 {
-		log.Println("must provide gpx file arg")
-		os.Exit(1)
-	}
-	if err := mainErr(args[0], *namePrefix, *split, *workers, *retries, *failFast, *cacheDir, *cacheTTL, *out, endpoints.specs); err != nil {
-		log.Println("Error:", err.Error())
-		os.Exit(1)
-	}
-	os.Exit(0)
 }
 
 // segmentIntersection tests whether segments p1-p2 and p3-p4 intersect, and
@@ -382,12 +331,11 @@ func wayRouteIntersections(wayGeometry []LatLon, routePoints []gpxgo.GPXPoint) (
 	return crossings, closest
 }
 
-func mainErr(file string, namePrefix string, split uint, workers int, retries int, failFast bool, cacheDir string, cacheTTL time.Duration, out string, endpoints []endpointSpec) error {
+func runRoute(ctx context.Context, stdout io.Writer, file string, namePrefix string, split uint, workers int, retries int, failFast bool, cacheDir string, cacheTTL time.Duration, out string, endpoints []endpointSpec) error {
 	if split == 0 {
 		return fmt.Errorf("--split must be greater than 0")
 	}
 
-	ctx := context.Background()
 	const queryTimeout = 180 * time.Second
 
 	f, err := os.Open(file)
@@ -396,7 +344,7 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 	}
 	gpx, err := gpxgo.Parse(f)
 	if err != nil {
-		_ = f.Close()
+		_ = f.Close() // Preserve the parsing error if closing also fails.
 		return fmt.Errorf("parsing gpx file: %w", err)
 	}
 	if err := f.Close(); err != nil {
@@ -513,7 +461,7 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 		w = f
 		wClose = f.Close
 	case "-":
-		w = os.Stdout
+		w = stdout
 	default:
 		f, err := os.OpenFile(out, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0600)
 		if err != nil {
@@ -525,7 +473,7 @@ func mainErr(file string, namePrefix string, split uint, workers int, retries in
 
 	if err := writePois(pois, getStats, w); err != nil {
 		if wClose != nil {
-			_ = wClose()
+			_ = wClose() // Preserve the output error if closing also fails.
 		}
 		return fmt.Errorf("writing pois: %w", err)
 	}

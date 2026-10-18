@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,7 +18,7 @@ import (
 	"time"
 )
 
-func Test_mainErr_cachedRoute(t *testing.T) {
+func Test_runRoute_cachedRoute(t *testing.T) {
 	for _, tc := range []struct {
 		name            string
 		emptyResponse   bool
@@ -86,7 +87,7 @@ func Test_mainErr_cachedRoute(t *testing.T) {
 				endpoints := []endpointSpec{{Name: "test", Interpreter: server.URL + "/interpreter", Status: server.URL + "/status"}}
 				cacheDir := filepath.Join(dir, "cache")
 				warmOutput := filepath.Join(dir, "warm.geojson")
-				if err := mainErr(route, "", 2, 1, 0, failFast, cacheDir, time.Hour, warmOutput, endpoints); err != nil {
+				if err := runRoute(context.Background(), io.Discard, route, "", 2, 1, 0, failFast, cacheDir, time.Hour, warmOutput, endpoints); err != nil {
 					t.Fatalf("populating cache: %v", err)
 				}
 				if got := queryRequests.Load(); got != 2 {
@@ -136,7 +137,7 @@ func Test_mainErr_cachedRoute(t *testing.T) {
 				if tc.noEndpoints {
 					endpoints = nil
 				}
-				err = mainErr(route, "", 2, 1, 0, failFast, cacheDir, time.Hour, output, endpoints)
+				err = runRoute(context.Background(), io.Discard, route, "", 2, 1, 0, failFast, cacheDir, time.Hour, output, endpoints)
 				if tc.wantErr != "" {
 					if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 						t.Fatalf("got error %v, want %q", err, tc.wantErr)

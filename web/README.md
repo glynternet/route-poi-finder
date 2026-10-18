@@ -48,7 +48,7 @@ Then:
 ## Generating input
 
 ```bash
-go run . --split 2 <route.gpx> > pois.geojson
+go run ./cmd/route-poi-finder --split 2 route.gpx > pois.geojson
 ```
 
 No build step, no dependencies to install — it's one HTML file.

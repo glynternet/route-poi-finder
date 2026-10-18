@@ -5,29 +5,39 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & Run Commands
 
 ```bash
-# Build
-go build -o route-poi-finder .
+# Build and install with the Dubplate Git version stamp
+make binaries
+make installs
 
-# Run directly (package main spans several files, so `go run main.go` fails)
-go run . [flags] <gpx-file>
+# Run directly (package main spans several files)
+go run ./cmd/route-poi-finder [flags] <gpx-file>
 
 # Example with flags (output is GeoJSON on stdout)
-go run . --name-prefix "Day1-" --split 10 route.gpx > pois.geojson
+go run ./cmd/route-poi-finder --name-prefix "Day1-" --split 10 route.gpx > pois.geojson
 ```
 
-Tests live in `main_test.go`:
+Tests live in `cmd/route-poi-finder/*_test.go`:
 ```bash
-go test ./...              # All tests
-go test -run TestName -v   # Single test
+make check                                         # Format, race tests, build, version
+go test ./...                                      # All tests
+go test ./cmd/route-poi-finder -run TestName -v      # Single test
 ```
 
 ## Architecture
 
-Go CLI tool that finds Points of Interest along GPS routes. `package main` is split across
-`main.go` (CLI, route geometry, and output), `queries.go` (the POI query definitions),
+Go CLI tool that finds Points of Interest along GPS routes. `package main` lives in
+`cmd/route-poi-finder/`, split across `main.go` (generated Dubplate bootstrap),
+`cmdtree.go` (Cobra flags, validation and logging bridge),
+`route.go` (route geometry and output), `queries.go` (the POI query definitions),
 `orchestrator.go` (query preparation, cache routing, client registration, and workers), and
 `cache.go` (disk response cache). The Overpass HTTP client, with per-server rate-limit slot
 handling, lives in `overpass/`.
+
+Dubplate v0.15.0 supplies the bootstrap, version command and generated build/CI files.
+Keep application changes out of generated `main.go`; implement `buildCmdTree` in
+`cmdtree.go`. See `README.md` for regeneration and the generated-file ownership list.
+Long flags use `--` and may precede or follow the GPX path. Diagnostics use Dubplate's
+logger on stderr (JSON when redirected), leaving stdout for GeoJSON.
 
 **Processing Flow:**
 1. Parse GPX file (requires exactly one track with one segment, containing at least one point)
